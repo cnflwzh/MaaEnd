@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; connect-src 'self'">
+<title>MaaEnd bridge: ready</title>
+<style>
+*{box-sizing:border-box}body{margin:0;width:1280px;height:720px;overflow:hidden;background:#0b1220;color:#dbeafe;font-family:Arial,sans-serif}
+header{padding:38px 44px}h1{margin:18px 0;font-size:42px;letter-spacing:-1px}h1 span{color:#5eead4}
+.pill{font-size:13px;letter-spacing:2px;color:#fcd34d}.sub{color:#94a3b8;font-size:19px;max-width:1000px;line-height:1.6}
+button{position:absolute;left:100px;top:280px;width:300px;height:160px;border:1px solid #5eead4;border-radius:18px;color:#ccfbf1;background:#123c44;font-size:28px}
+#state{position:absolute;left:100px;top:474px;font-size:22px;line-height:1.5;color:#5eead4}
+#stream{position:absolute;left:560px;top:260px;width:640px;height:360px;border:1px solid #334155;border-radius:12px;background:#020617}
+#streamlabel{position:absolute;left:560px;top:226px;font-size:14px;letter-spacing:1px;color:#94a3b8}
+input{position:absolute;left:100px;top:575px;width:380px;height:40px;background:#172136;color:#fff;border:1px solid #64748b;padding:8px;font-size:17px}
+footer{position:absolute;bottom:30px;left:44px;font-size:14px;color:#64748b}
+</style>
+</head>
+<body>
+<header><div class="pill">EXPERIMENTAL · EMBEDDED BROWSER · 1280 × 720</div><h1>MaaEnd <span>Cloud Web Bridge</span></h1><div class="sub">Offline validation surface. Native input → Maa custom controller → embedded renderer.<br>No cloud game is connected. The video below is a local {{VIDEO_DESCRIPTION}}.</div></header>
+<button id="target">Click target</button><div id="state">Clicks: 0<br>Keyboard: waiting</div>
+<div id="streamlabel">{{VIDEO_LABEL}}</div>
+<video id="stream" autoplay muted playsinline></video><canvas id="source" width="640" height="360" hidden></canvas>
+<input id="text" placeholder="Native text-input bridge test"><footer>WINDOWS / macOS / LINUX · SHARED QtWebEngine HOST · NO PAGE-TO-HOST API</footer>
+<script>
+let clicks=0, keys=0, frames=0;
+const state=document.getElementById('state');
+function status(){state.innerHTML='Clicks: '+clicks+'<br>Keyboard W: '+keys}
+document.getElementById('target').onclick=()=>{clicks++;status();document.title='MaaEnd bridge: clicked '+clicks};
+document.onkeydown=e=>{if(e.code==='KeyW'){keys++;status();document.title='MaaEnd bridge: key W '+keys}};
+document.getElementById('text').oninput=e=>{document.title='MaaEnd bridge: text '+e.target.value};
+const canvas=document.getElementById('source'), context=canvas.getContext('2d');
+function draw(t){frames++;context.fillStyle='#111f35';context.fillRect(0,0,640,360);context.fillStyle='#253c56';for(let x=0;x<640;x+=40){context.fillRect(x,0,1,360)}for(let y=0;y<360;y+=40){context.fillRect(0,y,640,1)}context.fillStyle='#5eead4';context.beginPath();context.arc(320+220*Math.sin(t/700),180+100*Math.cos(t/900),32,0,Math.PI*2);context.fill();context.fillStyle='#fff';context.font='bold 28px Arial';context.fillText('Decoded video / moving frame',28,46);context.font='20px Arial';context.fillText('Source frame '+frames,28,320);requestAnimationFrame(draw)}requestAnimationFrame(draw);
+const streamMode='{{VIDEO_MODE}}';
+(async()=>{try{if(streamMode==='canvas'){document.getElementById('stream').srcObject=canvas.captureStream(30);return}const send=new RTCPeerConnection({iceServers:[]}), receive=new RTCPeerConnection({iceServers:[]});window.testPeers=[send,receive];send.onicecandidate=e=>e.candidate&&receive.addIceCandidate(e.candidate);receive.onicecandidate=e=>e.candidate&&send.addIceCandidate(e.candidate);receive.ontrack=e=>document.getElementById('stream').srcObject=e.streams[0];const stream=canvas.captureStream(30);stream.getTracks().forEach(track=>send.addTrack(track,stream));await send.setLocalDescription(await send.createOffer());await receive.setRemoteDescription(send.localDescription);await receive.setLocalDescription(await receive.createAnswer());await send.setRemoteDescription(receive.localDescription)}catch(error){document.getElementById('streamlabel').textContent='LOCAL WEBRTC FAILED: '+error.message}})();
+</script>
+</body>
+</html>

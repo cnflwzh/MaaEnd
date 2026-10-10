@@ -1,0 +1,5 @@
+# Standalone experimental host; does not change MaaEnd's default dependencies.
+PySide6==6.12.0
+maafw==5.14.2
+numpy==2.5.3
+Pillow==12.3.0
