@@ -44,6 +44,6 @@ MXU 基线固定为 `MistEO/MXU@9fa8cc51e8ff8cd89d99f3ea55fe3a7a82e6ede3`，`mxu
 
 本次开发检出位于 `G:\DevProject\MaaEnd`，隔离 Python 环境、Go 工具链、pnpm、SDK 和新增下载缓存位于 `G:\DevData\MaaEnd`。已有 Rust 工具链和注册表缓存继续使用 `G:\DevData\Rust`。仅对构建进程设置 PATH，不修改系统 PATH。
 
-本地执行上述工作流中的命令体，分别生成 `build-cloudweb-inputs/mxu`、`build-cloudweb-inputs/maaend-runtime` 和 `build-cloudweb-inputs/qt-host`。最后依次执行 `build_full_package.py` 的 `assemble`、`test-native`、`seed-ui-check`，运行 `capture_window.ps1` 并人工检查主界面截图后，执行 `archive`。
+本地执行上述工作流中的命令体，分别生成 `build-cloudweb-inputs/mxu`、`build-cloudweb-inputs/maaend-runtime` 和 `build-cloudweb-inputs/qt-host`。按用户当前要求，仅构建并执行 `build_full_package.py assemble`、`build_full_package.py archive-unverified`，不运行验收，最终由用户自行测试。包内 `runtime-acceptance.json` 明确记录未验收状态。
 
 界面验证使用临时的 `config/mxu-MaaEnd.json`。打包时恢复干净配置，不保留验证实例或浏览器缓存。主程序目录为 `build-cloudweb-full/MaaEnd-CloudWeb`，便携 ZIP 和校验值位于 `build-cloudweb-full/deliverables`。

@@ -415,7 +415,7 @@ index 0000000..40391de
 +        return Err("CLOUD_WEB_ELEVATED".into());
 +    }
 +    let root = super::utils::get_exe_directory().map_err(|_| "CLOUD_WEB_HOST_MISSING")?;
-+    let name = if cfg!(windows) { "MaaEnd-CloudWeb-Prototype.exe" } else { "MaaEnd-CloudWeb-Prototype" };
++    let name = if cfg!(windows) { "CloudWebHost.exe" } else { "CloudWebHost" };
 +    let session = CloudWebSession::spawn(&root.join("cloudweb-host").join(name), url, session_id)?;
 +    let callback = CloudWebCallback { session: Arc::downgrade(&session) };
 +    let controller = Controller::new_custom(GuardedCallback(callback)).map_err(|_| "CLOUD_WEB_CREATE_FAILED")?;

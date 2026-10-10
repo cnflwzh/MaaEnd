@@ -21,7 +21,7 @@ maa_data, maa_binaries, maa_imports = collect_all("maa")
 # resources, locales and the required Qt plugins. Do not collect all PySide6:
 # unrelated Qt modules make the portable archive unnecessarily large.
 a = Analysis(
-    [str(source / "qt_launcher.py")],
+    [str(source / "host_main.py")],
     pathex=[str(source)],
     binaries=maa_binaries,
     datas=[(str(source / "fixture.html"), ".")] + maa_data,
@@ -35,7 +35,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="MaaEnd-CloudWeb-Prototype",
+    name="CloudWebHost",
     console=True,
     debug=False,
     strip=False,
@@ -47,5 +47,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="MaaEnd-CloudWeb-Prototype",
+    name="CloudWebHost",
 )

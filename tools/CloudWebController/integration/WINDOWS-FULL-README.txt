@@ -5,7 +5,7 @@ MaaEnd 云网页连接实验：完整 Windows x64 便携包
 cloudweb-host 是应用内部使用的浏览器子进程，不是主程序。
 
 1. 将整个 ZIP 解压到一个新的可写文件夹，不要覆盖现有 MaaEnd 安装。
-2. 双击 MaaEnd.exe。首次验证请选择本地测试页。
+2. 双击 MaaEnd.exe，在右侧「连接设置 → 控制器」选择「云·终末地网页版」。
 3. 正式网页需要明确 HTTPS 地址。登录、排队和启动服务都由用户手动处理。
 4. 不要只复制 EXE；maafw、agent、resource、tasks、cloudweb-host 都必须保留。
 
@@ -21,7 +21,8 @@ MaaEnd 的 Tauri 主界面使用 Microsoft Edge WebView2；云网页视图使用
 不要在此次实验中登录真实账号或付费。
 
 cloudweb-build-info.json 记录源码提交、MXU 基线及补丁、原生运行库版本和文件校验值。
-validation 包含实际执行的验证报告和完整主界面截图。
+本版按用户要求仅完成实现和编译，运行验收由用户自行完成。
+状态记录见 runtime-acceptance.json；validation 中的编译记录不代表运行验收。
 分享 debug 或截图前请检查私人网页、账号和其他个人信息。
 LICENSE、licenses 和 cloudweb-host/licenses 包含开源许可材料。
 源码见记录的仓库与提交，MXU 改动补丁附在 source/CloudWebIntegration。

@@ -118,7 +118,7 @@ def assemble():
     required = (
         "MaaEnd.exe", "interface.json", "mxu-cloudweb.json", "agent/go-service.exe", "agent/cpp-algo.exe",
         "maafw/MaaFramework.dll", "maafw/MaaCustomControlUnit.dll",
-        "cloudweb-host/MaaEnd-CloudWeb-Prototype.exe",
+        "cloudweb-host/CloudWebHost.exe",
     )
     for relative in required:
         if not (APP / relative).is_file():
@@ -236,33 +236,38 @@ def seed_ui_check():
     config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def archive():
+def archive(require_validation=True):
     evidence = OUT / "verification"
-    # Native bridge/Tasker verification must produce its own successful report.
-    report = json.loads((evidence / "integration-report.json").read_text(encoding="utf-8"))
-    if report.get("result") != "passed":
-        raise RuntimeError("Full MaaEnd integration verification did not pass")
-    screenshot = evidence / "MaaEnd-window.png"
-    if not screenshot.is_file():
-        raise RuntimeError("Full MaaEnd window screenshot is missing")
-    from PIL import Image
-    with Image.open(screenshot) as captured:
-        colors = captured.convert("RGB").resize((100, 100)).getcolors(10000) or []
-        if captured.width < 500 or captured.height < 350 or len(colors) < 30:
-            raise RuntimeError("Full MaaEnd window capture is blank or incomplete")
-    # Never ship a verification run's selected tasks, browser cache or logs as
-    # the user's starting configuration. Keep only the explicit evidence folder.
-    # Remove run-generated backups/layout caches too, then restore only the
-    # explicit shipping config under MXU's actual config directory.
-    shutil.rmtree(APP / "config")
-    (APP / "config").mkdir()
-    shutil.copy2(OUT / "clean-config.json", APP / "config" / "mxu-MaaEnd.json")
-    (APP / "mxu-MaaEnd.json").unlink(missing_ok=True)
-    shutil.copy2(OUT / "shipping-interface.json", APP / "interface.json")
+    if require_validation:
+        # Native bridge/Tasker verification must produce its own successful report.
+        report = json.loads((evidence / "integration-report.json").read_text(encoding="utf-8"))
+        if report.get("result") != "passed":
+            raise RuntimeError("Full MaaEnd integration verification did not pass")
+        screenshot = evidence / "MaaEnd-window.png"
+        if not screenshot.is_file():
+            raise RuntimeError("Full MaaEnd window screenshot is missing")
+        from PIL import Image
+        with Image.open(screenshot) as captured:
+            colors = captured.convert("RGB").resize((100, 100)).getcolors(10000) or []
+            if captured.width < 500 or captured.height < 350 or len(colors) < 30:
+                raise RuntimeError("Full MaaEnd window capture is blank or incomplete")
+        # Never ship a verification run's selected tasks, browser cache or logs as
+        # the user's starting configuration. Keep only the explicit evidence folder.
+        # Remove run-generated backups/layout caches too, then restore only the
+        # explicit shipping config under MXU's actual config directory.
+        shutil.rmtree(APP / "config")
+        (APP / "config").mkdir()
+        shutil.copy2(OUT / "clean-config.json", APP / "config" / "mxu-MaaEnd.json")
+        (APP / "mxu-MaaEnd.json").unlink(missing_ok=True)
+        shutil.copy2(OUT / "shipping-interface.json", APP / "interface.json")
     for directory in ("cache", "debug"):
         if (APP / directory).exists():
             shutil.rmtree(APP / directory)
-    shutil.copytree(evidence, APP / "validation" / "full-app", dirs_exist_ok=True)
+    if require_validation:
+        shutil.copytree(evidence, APP / "validation" / "full-app", dirs_exist_ok=True)
+    else:
+        status = {"runtime_acceptance": "not performed on this final package", "reason": "User requested implementation and compilation only; user will test", "cloud_game_compatibility": "unverified"}
+        (APP / "runtime-acceptance.json").write_text(json.dumps(status, indent=2), encoding="utf-8")
     deliverables = OUT / "deliverables"
     deliverables.mkdir(parents=True, exist_ok=True)
     info = json.loads((APP / "cloudweb-build-info.json").read_text(encoding="utf-8"))
@@ -276,13 +281,14 @@ def archive():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", choices=("download-framework", "apply-mxu", "install-framework", "assemble", "test-native", "seed-ui-check", "archive"))
+    parser.add_argument("stage", choices=("download-framework", "apply-mxu", "install-framework", "assemble", "test-native", "seed-ui-check", "archive", "archive-unverified"))
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
     {
         "download-framework": download_framework, "apply-mxu": apply_mxu,
         "install-framework": install_framework, "assemble": assemble,
         "test-native": test_native, "seed-ui-check": seed_ui_check, "archive": archive,
+        "archive-unverified": lambda: archive(require_validation=False),
     }[args.stage]()
 
 
