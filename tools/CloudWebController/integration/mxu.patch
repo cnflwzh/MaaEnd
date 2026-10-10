@@ -1525,7 +1525,7 @@ index 384bdf5..8f76f98 100644
          Some(p) if !p.trim().is_empty() => p.to_string(),
          _ => {
 diff --git a/src/components/ConnectionPanel.tsx b/src/components/ConnectionPanel.tsx
-index 9744492..3eee9a1 100644
+index 9744492..407f01b 100644
 --- a/src/components/ConnectionPanel.tsx
 +++ b/src/components/ConnectionPanel.tsx
 @@ -6,6 +6,7 @@ import {
@@ -1578,7 +1578,7 @@ index 9744492..3eee9a1 100644
        // PlayCover 不需要搜索，直接连接
        autoReconnectAttempted.add(instanceId);
        handleConnect();
-@@ -633,8 +645,29 @@ export function ConnectionPanel() {
+@@ -633,8 +645,32 @@ export function ConnectionPanel() {
    };
  
    // 连接设备
@@ -1602,14 +1602,17 @@ index 9744492..3eee9a1 100644
 -    if (!currentController) return;
 +    if (!currentController || !instanceId || isConnecting || isRunning) return;
 +    autoReconnectAttempted.add(instanceId);
-+    if (controllerType === 'CloudWeb' && !isValidCloudWebUrl(cloudWebUrl)) {
++    if (
++      controllerType === 'CloudWeb' &&
++      (!cloudWebUrl.trim() || !isValidCloudWebUrl(cloudWebUrl))
++    ) {
 +      setDeviceError(t('controller.cloudWebInvalidUrl'));
 +      return;
 +    }
  
      setIsConnecting(true);
      setDeviceError(null);
-@@ -682,6 +715,13 @@ export function ConnectionPanel() {
+@@ -682,6 +718,13 @@ export function ConnectionPanel() {
          };
          deviceName = selectedWlrootsSocket;
          targetType = 'device';
@@ -1623,7 +1626,7 @@ index 9744492..3eee9a1 100644
        } else if (controllerType === 'PlayCover') {
          // 保存 PlayCover 地址到实例配置
          setInstanceSavedDevice(instanceId, { playcoverAddress });
-@@ -826,6 +866,8 @@ export function ConnectionPanel() {
+@@ -826,6 +869,8 @@ export function ConnectionPanel() {
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1632,15 +1635,16 @@ index 9744492..3eee9a1 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -1395,6 +1437,7 @@ export function ConnectionPanel() {
+@@ -1395,6 +1440,8 @@ export function ConnectionPanel() {
        return isLinuxReadyWith(selectedGamescopeInstance, selectedWlrootsSocket);
      }
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
-+    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
++    if (controllerType === 'CloudWeb')
++      return !!instanceId && !!cloudWebUrl.trim() && isValidCloudWebUrl(cloudWebUrl);
      return false;
    };
  
-@@ -1421,6 +1464,9 @@ export function ConnectionPanel() {
+@@ -1421,6 +1468,9 @@ export function ConnectionPanel() {
      // 获取设备显示文本（优先显示具体设备名）
      const getDeviceStatusText = () => {
        const savedDevice = activeInstance?.savedDevice;
@@ -1650,7 +1654,7 @@ index 9744492..3eee9a1 100644
        if (savedDevice?.adbDeviceName) {
          return truncateText(savedDevice.adbDeviceName, 6);
        }
-@@ -1469,7 +1515,8 @@ export function ConnectionPanel() {
+@@ -1469,7 +1519,8 @@ export function ConnectionPanel() {
            ((s.gamescopeDisplayNo !== undefined &&
              (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
              (s.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
@@ -1660,7 +1664,7 @@ index 9744492..3eee9a1 100644
        );
      };
  
-@@ -1668,6 +1715,89 @@ export function ConnectionPanel() {
+@@ -1668,6 +1719,89 @@ export function ConnectionPanel() {
                </div>
              )}
  
@@ -1751,7 +1755,7 @@ index 9744492..3eee9a1 100644
              {controllerType === 'PlayCover' && (
                <div className="flex gap-2">
 diff --git a/src/components/DeviceSelector.tsx b/src/components/DeviceSelector.tsx
-index 2546c91..270b6fe 100644
+index 2546c91..4926353 100644
 --- a/src/components/DeviceSelector.tsx
 +++ b/src/components/DeviceSelector.tsx
 @@ -12,6 +12,7 @@ import {
@@ -1808,15 +1812,16 @@ index 2546c91..270b6fe 100644
        } else if (controllerType === 'PlayCover') {
          deviceName = playcoverAddress;
          targetType = 'device';
-@@ -482,6 +500,7 @@ export function DeviceSelector({
+@@ -482,6 +500,8 @@ export function DeviceSelector({
      if (isDesktopWindowController) return !!selectedWindow;
      if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
-+    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
++    if (controllerType === 'CloudWeb')
++      return !!instanceId && !!cloudWebUrl.trim() && isValidCloudWebUrl(cloudWebUrl);
      return false;
    };
  
-@@ -498,6 +517,8 @@ export function DeviceSelector({
+@@ -498,6 +518,8 @@ export function DeviceSelector({
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1825,7 +1830,7 @@ index 2546c91..270b6fe 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -520,6 +541,8 @@ export function DeviceSelector({
+@@ -520,6 +542,8 @@ export function DeviceSelector({
          return t('controller.macos');
        case 'Gamepad':
          return t('controller.gamepad');
@@ -1834,7 +1839,7 @@ index 2546c91..270b6fe 100644
        default:
          return controllerType;
      }
-@@ -539,6 +562,17 @@ export function DeviceSelector({
+@@ -539,6 +563,17 @@ export function DeviceSelector({
          )}
        </div>
  
@@ -1852,7 +1857,7 @@ index 2546c91..270b6fe 100644
        {/* PlayCover 地址输入 */}
        {controllerType === 'PlayCover' && (
          <div className="space-y-2">
-@@ -687,10 +721,10 @@ export function DeviceSelector({
+@@ -687,10 +722,10 @@ export function DeviceSelector({
        )}
  
        {/* PlayCover 需要手动连接按钮 */}
@@ -1911,7 +1916,7 @@ index 644006d..66317ae 100644
              onPhaseChange?.('searching');
 diff --git a/src/components/connection/CloudWebUrlInput.tsx b/src/components/connection/CloudWebUrlInput.tsx
 new file mode 100644
-index 0000000..7edddde
+index 0000000..73fae30
 --- /dev/null
 +++ b/src/components/connection/CloudWebUrlInput.tsx
 @@ -0,0 +1,48 @@
@@ -1930,7 +1935,7 @@ index 0000000..7edddde
 +export function CloudWebUrlInput({ value, onChange, disabled }: CloudWebUrlInputProps) {
 +  const { t } = useTranslation();
 +  const id = useId();
-+  const invalid = !isValidCloudWebUrl(value);
++  const invalid = !value.trim() || !isValidCloudWebUrl(value);
 +  return (
 +    <details className="flex-1 min-w-0 space-y-1.5">
 +      <summary className="text-xs text-text-secondary cursor-pointer">
@@ -1964,7 +1969,7 @@ index 0000000..7edddde
 +  );
 +}
 diff --git a/src/components/connection/useDeviceConnection.ts b/src/components/connection/useDeviceConnection.ts
-index bcc696b..1554dcd 100644
+index bcc696b..654b2ed 100644
 --- a/src/components/connection/useDeviceConnection.ts
 +++ b/src/components/connection/useDeviceConnection.ts
 @@ -9,7 +9,16 @@ import {
@@ -2003,7 +2008,7 @@ index bcc696b..1554dcd 100644
  
 +  const handleConnectCloudWeb = useCallback(async () => {
 +    if (isConnecting || activeInstance?.isRunning) return;
-+    if (!isValidCloudWebUrl(cloudWebUrl)) {
++    if (!cloudWebUrl.trim() || !isValidCloudWebUrl(cloudWebUrl)) {
 +      setDeviceError(t('controller.cloudWebInvalidUrl'));
 +      return;
 +    }
@@ -2056,11 +2061,12 @@ index bcc696b..1554dcd 100644
      isDesktopWindowController,
      selectedAdbDevice,
      selectedWindow,
-@@ -430,9 +486,12 @@ export function useDeviceConnection({
+@@ -430,9 +486,13 @@ export function useDeviceConnection({
      if (isDesktopWindowController) return !!selectedWindow;
      if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
-+    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
++    if (controllerType === 'CloudWeb')
++      return !!instanceId && !!cloudWebUrl.trim() && isValidCloudWebUrl(cloudWebUrl);
      return false;
    }, [
      controllerType,
@@ -2069,7 +2075,7 @@ index bcc696b..1554dcd 100644
      isDesktopWindowController,
      selectedAdbDevice,
      selectedWindow,
-@@ -450,6 +509,7 @@ export function useDeviceConnection({
+@@ -450,6 +510,7 @@ export function useDeviceConnection({
      selectedWindow,
      showDeviceDropdown,
      playcoverAddress,
@@ -2077,7 +2083,7 @@ index bcc696b..1554dcd 100644
      cachedAdbDevices,
      cachedWin32Windows,
      cachedWlrootsSockets,
-@@ -464,11 +524,13 @@ export function useDeviceConnection({
+@@ -464,11 +525,13 @@ export function useDeviceConnection({
      setSelectedWindow,
      setShowDeviceDropdown,
      setPlaycoverAddress,
@@ -2092,7 +2098,7 @@ index bcc696b..1554dcd 100644
      canConnect,
      ensureMaaInitialized,
 diff --git a/src/i18n/locales/en-US.ts b/src/i18n/locales/en-US.ts
-index 154e625..ad51790 100644
+index 154e625..6eae825 100644
 --- a/src/i18n/locales/en-US.ts
 +++ b/src/i18n/locales/en-US.ts
 @@ -402,6 +402,29 @@ export default {
@@ -2116,7 +2122,7 @@ index 154e625..ad51790 100644
 +    cloudWebAdvanced: 'Advanced (preview debug URL)',
 +    cloudWebPreviewNote:
 +      'Login is saved locally. The official entry is not available yet; Connect binds the browser only. Automatic tasks after queuing are not enabled.',
-+    cloudWebUrlPlaceholder: 'HTTPS URL (empty for local test page)',
++    cloudWebUrlPlaceholder: 'HTTPS debug URL (official entry not yet available)',
 +    cloudWebHint:
 +      'Enter the cloud game HTTPS entry point. Leave empty for the bundled offline test page; it does not log in or enter the real game. Each instance has its own browser session.',
 +    cloudWebFixture: 'Local test page',
@@ -2182,7 +2188,7 @@ index c3bee79..8f75460 100644
      selectController: '컨트롤러 선택',
      adb: 'Android 기기',
 diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
-index 3dca5fc..d7cd5cd 100644
+index 3dca5fc..ced2b24 100644
 --- a/src/i18n/locales/zh-CN.ts
 +++ b/src/i18n/locales/zh-CN.ts
 @@ -390,6 +390,24 @@ export default {
@@ -2202,7 +2208,7 @@ index 3dca5fc..d7cd5cd 100644
 +    cloudWebAdvanced: '高级设置（预开发调试网址）',
 +    cloudWebPreviewNote:
 +      '登录状态保存在本机。官方入口尚未上线；连接只绑定浏览器，排队后自动运行任务暂未启用。',
-+    cloudWebUrlPlaceholder: 'HTTPS 地址（留空使用本地验证页）',
++    cloudWebUrlPlaceholder: '填写 HTTPS 调试网址（官方入口待公布）',
 +    cloudWebHint:
 +      '填写云游戏的 HTTPS 入口。留空使用随包本地验证页，不会登录或进入真实游戏。每个配置使用独立浏览器会话。',
 +    cloudWebFixture: '本地验证页',
