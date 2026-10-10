@@ -8,15 +8,17 @@ behavior requires platform testing; hidden/minimized rendering is unsupported.
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import os
+import json
 from threading import Condition, Event
 import time
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, QObject, QPoint, QPointF, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, QObject, QPoint, QPointF, QThread, QTimer, Qt, QUrl, Signal, Slot
 from PySide6.QtGui import QImage, QInputMethodEvent, QKeyEvent, QMouseEvent, QWheelEvent
-from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor
+from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePermission, QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
 
@@ -102,7 +104,7 @@ class _View(QWebEngineView):
 
 class QtBrowserHost(QObject):
     """UI-owned browser; all public operations except construction are safe
-    from a worker. A passed profile must be dedicated and off-the-record.
+    from a worker. Profiles are dedicated to MaaEnd; offline fixtures stay private.
 
     wait_ready and evaluate_readonly cannot block the UI thread. Input delivery
     only acknowledges dispatch; use a fresh screenshot/page state to verify its
@@ -114,7 +116,7 @@ class QtBrowserHost(QObject):
     _close_requested = Signal()
     _release_requested = Signal()
 
-    def __init__(self, url=None, test_html=None, profile=None, allowed_origins=()):
+    def __init__(self, url=None, test_html=None, profile=None, allowed_origins=(), profile_dir=None):
         app = QApplication.instance()
         if app is None or QThread.currentThread() != app.thread():
             raise RuntimeError("Construct QtBrowserHost on the QApplication main thread")
@@ -137,11 +139,22 @@ class QtBrowserHost(QObject):
         origins = make_origins(url, allowed_origins) if url is not None else frozenset()
         if url is None and allowed_origins:
             raise ValueError("Offline mode cannot allow remote origins")
-        self.profile = profile if profile is not None else QWebEngineProfile(self)
-        if not self.profile.isOffTheRecord():
-            raise ValueError("The controller requires an off-the-record browser profile")
-        self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
-        self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
+        if profile_dir is not None:
+            if url is None or profile is not None:
+                raise ValueError("Persistent profiles require a remote URL and exclusive ownership")
+            directory = Path(profile_dir).resolve()
+            directory.mkdir(parents=True, exist_ok=True)
+            self.profile = QWebEngineProfile("MaaEndCloudWeb", self)
+            self.profile.setPersistentStoragePath(str(directory / "storage"))
+            self.profile.setCachePath(str(directory / "cache"))
+            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+            self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        else:
+            self.profile = profile if profile is not None else QWebEngineProfile(self)
+            if not self.profile.isOffTheRecord():
+                raise ValueError("Use profile_dir for an owned persistent browser profile")
+            self.profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+            self.profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.MemoryHttpCache)
         self._resource_policy = _ResourcePolicy(url is None, self.profile)
         self.profile.setUrlRequestInterceptor(self._resource_policy)
         self.profile.downloadRequested.connect(lambda download: download.cancel())
@@ -164,7 +177,19 @@ class QtBrowserHost(QObject):
             if attribute is not None:
                 settings.setAttribute(attribute, False)
         settings.setUnknownUrlSchemePolicy(QWebEngineSettings.UnknownUrlSchemePolicy.DisallowUnknownUrlSchemes)
-        self.page.permissionRequested.connect(lambda permission: permission.deny())
+        settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        def handle_permission(permission):
+            # PC games need pointer lock. Do not grant microphone/camera access.
+            if permission.permissionType() == QWebEnginePermission.PermissionType.MouseLock:
+                try:
+                    permitted = https_origin(permission.origin().toString()) in origins
+                except ValueError:
+                    permitted = False
+                if permitted and self.view.isVisible() and self.view.isActiveWindow():
+                    permission.grant()
+                    return
+            permission.deny()
+        self.page.permissionRequested.connect(handle_permission)
         self.page.fileSystemAccessRequested.connect(lambda request: request.reject())
         self.page.registerProtocolHandlerRequested.connect(lambda request: request.reject())
         self.page.fullScreenRequested.connect(lambda request: request.reject())
@@ -187,10 +212,50 @@ class QtBrowserHost(QObject):
         self._requested.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
         self._close_requested.connect(self.view.close, Qt.ConnectionType.QueuedConnection)
         self._release_requested.connect(self._release_inputs, Qt.ConnectionType.QueuedConnection)
+        if profile_dir is not None:
+            self._diagnostic_path = Path(profile_dir) / "engine-diagnostics.json"
+            self._diagnostic_timer = QTimer(self)
+            self._diagnostic_timer.setInterval(10000)
+            self._diagnostic_timer.timeout.connect(self._record_engine_diagnostics)
+            self._diagnostic_timer.start()
         if url is None:
             self.view.setHtml(test_html)
         else:
             self.view.setUrl(QUrl(url))
+
+    def _record_engine_diagnostics(self):
+        """Record capabilities and stream state, never page text, URLs or cookies."""
+        if self._closed:
+            return
+        script = """(() => {
+          const v = document.createElement('video');
+          const supported = ['video/H264','video/VP8','video/VP9','video/AV1'];
+          const codecs = typeof RTCRtpReceiver === 'undefined' ? [] :
+            (RTCRtpReceiver.getCapabilities('video')?.codecs || []).map(c => c.mimeType);
+          return JSON.stringify({
+            documentReady: document.readyState,
+            webRtc: typeof RTCPeerConnection !== 'undefined',
+            rtcCodecs: supported.filter(c => codecs.includes(c)),
+            h264Playback: v.canPlayType('video/mp4; codecs="avc1.42E01E"'),
+            vp8Playback: v.canPlayType('video/webm; codecs="vp8"'),
+            pointerLocked: !!document.pointerLockElement,
+            videos: Array.from(document.querySelectorAll('video')).slice(0,8).map(v => ({
+              readyState:v.readyState, networkState:v.networkState, paused:v.paused,
+              width:v.videoWidth, height:v.videoHeight, errorCode:v.error?.code || 0
+            }))
+          });
+        })()"""
+        def save(value):
+            if self._closed or not isinstance(value, str) or len(value) > 8192:
+                return
+            try:
+                data = json.loads(value)
+                data["pageLoaded"] = self._ready
+                data["persistentProfile"] = not self.profile.isOffTheRecord()
+                self._diagnostic_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except (ValueError, OSError):
+                pass
+        self.page.runJavaScript(script, save)
 
     def _is_ui(self):
         return QThread.currentThread() == self.thread()
@@ -532,7 +597,13 @@ class QtBrowserHost(QObject):
                 value = ")!@#$%^&*("[code - 0x30]
         if 0x11 in held or 0x12 in held:
             value = ""
-        event = QKeyEvent(QEvent.Type.KeyPress if down else QEvent.Type.KeyRelease, keys.get(code, code), self._modifiers(), value)
+        event_type = QEvent.Type.KeyPress if down else QEvent.Type.KeyRelease
+        if os.name == "nt":
+            import ctypes
+            scan = ctypes.windll.user32.MapVirtualKeyW(code, 0)
+            event = QKeyEvent(event_type, keys.get(code, code), self._modifiers(), scan, code, 0, value)
+        else:
+            event = QKeyEvent(event_type, keys.get(code, code), self._modifiers(), value)
         QCoreApplication.sendEvent(self.view.focusProxy() or self.view, event)
 
     def click_key(self, code):

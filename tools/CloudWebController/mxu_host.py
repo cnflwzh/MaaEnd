@@ -8,6 +8,7 @@ serial protocol worker never blocks Qt's UI thread.
 import argparse
 import base64
 import json
+import hashlib
 import os
 from pathlib import Path
 import sys
@@ -135,13 +136,17 @@ def main(argv=None):
     reader, writer = _protocol_streams()
     parser = argparse.ArgumentParser(description="MXU private embedded browser host")
     parser.add_argument("--url", default="")
+    parser.add_argument("--profile-root", type=Path)
+    parser.add_argument("--session-id", default="default")
     args = parser.parse_args(argv)
+    profile_lock = None
+    host = None
     try:
         validate_webengine_environment(os.environ, sys.argv)
         offline = args.url in ("", "bundled-fixture")
         if not offline:
             https_origin(args.url)
-        from PySide6.QtCore import QTimer
+        from PySide6.QtCore import QTimer, QLockFile
         from PySide6.QtWidgets import QApplication
         from qt_host import QtBrowserHost
 
@@ -152,19 +157,40 @@ def main(argv=None):
             html = html.replace("{{VIDEO_LABEL}}", "LOCAL CANVAS → VIDEO / NO CLOUD SERVER")
             host = QtBrowserHost(test_html=html)
         else:
-            host = QtBrowserHost(url=args.url)
+            # Stable across launches, independent of URL query/login tokens.
+            root = args.profile_root
+            if root is None:
+                root = Path(sys.executable).resolve().parent.parent / "config" / "cloudweb-profiles"
+            identity = args.session_id + "\n" + https_origin(args.url)
+            directory = root.resolve() / hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+            directory.mkdir(parents=True, exist_ok=True)
+            profile_lock = QLockFile(str(directory / "maaend-profile.lock"))
+            profile_lock.setStaleLockTime(0)
+            if not profile_lock.tryLock(0):
+                raise RuntimeError("This MaaEnd browser profile is already in use")
+            host = QtBrowserHost(url=args.url, profile_dir=directory)
         host.closed.connect(app.quit)
         host.show()
         worker = threading.Thread(target=serve, args=(host, reader, writer), daemon=True, name="mxu-private-stdio")
         QTimer.singleShot(0, worker.start)
         result = app.exec()
         # A closed window may leave stdin blocked. It must not keep the child
-        # alive; the daemon owns no persistent profile or input outside Qt.
+        # alive. Destroy pages before their profile to flush persistent data.
         worker.join(timeout=0.2)
         return result
     except Exception as error:
         print("MXU browser host failed: " + safe_load_error(str(error)), file=sys.stderr, flush=True)
         return 2
+    finally:
+        if host is not None:
+            import shiboken6
+            # Pages must be destroyed before their owning disk profile.
+            if shiboken6.isValid(host.view):
+                shiboken6.delete(host.view)
+            if shiboken6.isValid(host.profile):
+                shiboken6.delete(host.profile)
+        if profile_lock is not None:
+            profile_lock.unlock()
 
 
 if __name__ == "__main__":

@@ -86,6 +86,8 @@ def install_framework():
 
 
 def assemble():
+    if APP.exists():
+        raise RuntimeError("Refusing to overwrite an existing application; use --output with a new directory")
     runtime = INPUTS / "maaend-runtime"
     application = INPUTS / "mxu"
     host = INPUTS / "qt-host"
@@ -237,6 +239,8 @@ def seed_ui_check():
 
 
 def archive(require_validation=True):
+    if (APP / "config" / "cloudweb-profiles").exists():
+        raise RuntimeError("Refusing to archive an application containing browser login profiles")
     evidence = OUT / "verification"
     if require_validation:
         # Native bridge/Tasker verification must produce its own successful report.
@@ -280,9 +284,13 @@ def archive(require_validation=True):
 
 
 def main():
+    global OUT, APP
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("download-framework", "apply-mxu", "install-framework", "assemble", "test-native", "seed-ui-check", "archive", "archive-unverified"))
+    parser.add_argument("--output", type=Path, default=OUT, help="Fresh output directory; existing applications are never overwritten")
     args = parser.parse_args()
+    OUT = args.output.resolve()
+    APP = OUT / "MaaEnd-CloudWeb"
     OUT.mkdir(parents=True, exist_ok=True)
     {
         "download-framework": download_framework, "apply-mxu": apply_mxu,

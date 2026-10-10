@@ -1,30 +1,33 @@
-MaaEnd 云网页连接实验：完整 Windows x64 便携包
+MaaEnd 云网页控制器预开发版（Windows x64）
 
-这是完整 MaaEnd 界面的实验构建。入口是根目录的 MaaEnd.exe。
-保留原有任务列表、配置和资源，在连接区域增加云网页实验入口。
-cloudweb-host 是应用内部使用的浏览器子进程，不是主程序。
+启动根目录的 MaaEnd.exe，保留整个目录。cloudweb-host 是内部组件。
+原任务列表、资源、Go/C++ Agent 和 Maa Tasker 保持原有流程。
 
-1. 将整个 ZIP 解压到一个新的可写文件夹，不要覆盖现有 MaaEnd 安装。
-2. 双击 MaaEnd.exe，在右侧「连接设置 → 控制器」选择「云·终末地网页版」。
-3. 正式网页需要明确 HTTPS 地址。登录、排队和启动服务都由用户手动处理。
-4. 不要只复制 EXE；maafw、agent、resource、tasks、cloudweb-host 都必须保留。
+连接设置 → 控制器 → 云·终末地网页版：
+1. 官方入口尚未公布。展开“高级设置”，填写目前使用的 HTTPS 调试网址。
+2. 左侧“登录”打开浏览器供手动登录，不启动任务。
+3. 右侧“连接”复用登录浏览器并绑定原 Maa 控制器。
+4. 当前版本仍需手动完成启动和排队、确认进入游戏后再运行左侧任务。
+   网页加载完成不等于游戏已就绪；本版没有自动排队或排队后自动运行。
 
-本包是便携 ZIP，不是安装程序，未做代码签名。
-版本标记为 cloudweb-dev；实验版停用自动更新。更新请重新下载完整实验包，
-不要使用正式版更新包覆盖本目录，否则实验控制器可能被替换。
-MaaEnd 的 Tauri 主界面使用 Microsoft Edge WebView2；云网页视图使用随包 Qt WebEngine。
-如果电脑缺少 WebView2，请使用微软官方网站的安装方式。
-不要关闭系统安全功能、Chromium 沙箱或证书校验。
+Cookie（包括会话 Cookie）、LocalStorage 等由专用浏览器配置保存。
+位置：config/cloudweb-profiles/<实例和站点对应目录>/storage
+浏览器缓存：同目录下 cache。请正常断开连接或退出程序，以完成写盘。
+不同实例和站点隔离。不要删除 config/cloudweb-profiles 或分享该目录。
+网站使登录过期、账号退出或风控要求验证时，仍需重新登录。
+旧版使用临时配置，关闭后丢失的登录状态无法恢复；升级后首次需重新登录。
 
-本地测试不代表真实云终末地或所有既有任务已兼容。
-实时串流编码、DRM、输入锁定、延迟、站点登录/排队均需实际验收。
-不要在此次实验中登录真实账号或付费。
+游戏输入按 PC 键盘和鼠标事件发送。允许当前页面在前台申请鼠标锁定，
+但自动化的原始相对鼠标移动尚未完整接通，不宣称全部 PC 任务兼容。
+浏览器每 10 秒在对应配置目录写入 engine-diagnostics.json，记录视频状态、
+WebRTC 编码能力和加载状态；不读取 Cookie 值、页面文字、网址参数或账号。
+网易实际串流与官方云终末地均未完成本版运行验收。
 
-cloudweb-build-info.json 记录源码提交、MXU 基线及补丁、原生运行库版本和文件校验值。
-本版按用户要求仅完成实现和编译，运行验收由用户自行完成。
-状态记录见 runtime-acceptance.json；validation 中的编译记录不代表运行验收。
-分享 debug 或截图前请检查私人网页、账号和其他个人信息。
-LICENSE、licenses 和 cloudweb-host/licenses 包含开源许可材料。
-源码见记录的仓库与提交，MXU 改动补丁附在 source/CloudWebIntegration。
-mxu-formatted.patch 是使用 rustfmt 格式化后实际参与本地构建的完整补丁；
-对应工具版本保存在验证日志中，可从记录的 MXU 基线提交复现源码。
+现有命令行：MaaEnd.exe --autostart --instance "实例名" --quit-after-run
+这是原 GUI 的自动启动功能，需要 Windows 图形会话；不是无 GUI 服务器模式。
+浏览器隐藏或最小化仍不支持截图输入；不要当作服务器全天无人值守交付。
+macOS 未实机验证。官方入口上线后才可落实启动/排队/就绪识别。
+
+请解压到新目录，不覆盖已有安装。旧目录中的用户配置和登录数据不受影响。
+本版未运行自动化测试，按用户要求由用户验收。runtime-acceptance.json 记录此状态。
+cloudweb-build-info.json 记录源提交和构建信息。LICENSE、licenses 保存许可材料。

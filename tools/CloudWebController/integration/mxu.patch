@@ -1,9 +1,9 @@
 diff --git a/src-tauri/src/commands/cloud_web.rs b/src-tauri/src/commands/cloud_web.rs
 new file mode 100644
-index 0000000..40391de
+index 0000000..04847c6
 --- /dev/null
 +++ b/src-tauri/src/commands/cloud_web.rs
-@@ -0,0 +1,626 @@
+@@ -0,0 +1,917 @@
 +//! Product-owned embedded browser controller. The remote page never receives an
 +//! MXU API, executable path, socket, or MaaFramework handle.
 +//!
@@ -103,11 +103,17 @@ index 0000000..40391de
 +}
 +
 +impl CloudWebSession {
++    pub fn is_healthy(&self) -> bool {
++        self.healthy.load(Ordering::Acquire)
++    }
++
 +    fn spawn(executable: &Path, url: &str, session_id: &str) -> Result<Arc<Self>, String> {
 +        let url = normalized_url(url)?;
 +        if session_id.is_empty()
 +            || session_id.len() > 128
-+            || !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
++            || !session_id
++                .bytes()
++                .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
 +        {
 +            return Err("CLOUD_WEB_INVALID_SESSION".into());
 +        }
@@ -115,8 +121,24 @@ index 0000000..40391de
 +            return Err("CLOUD_WEB_HOST_MISSING".into());
 +        }
 +        let mut command = Command::new(executable);
-+        command.arg("--mxu-host").arg("--url").arg(url)
-+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
++        command
++            .arg("--mxu-host")
++            .arg("--url")
++            .arg(url)
++            .arg("--session-id")
++            .arg(session_id)
++            .arg("--profile-root")
++            .arg(
++                executable
++                    .parent()
++                    .and_then(Path::parent)
++                    .ok_or("CLOUD_WEB_HOST_MISSING")?
++                    .join("config")
++                    .join("cloudweb-profiles"),
++            )
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit());
 +        // Hide only the Python/stdio console. The Qt browser window stays visible.
 +        #[cfg(windows)]
 +        {
@@ -140,9 +162,10 @@ index 0000000..40391de
 +        std::thread::spawn(move || {
 +            let mut reader = BufReader::new(stdout);
 +            loop {
-+                let result = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
-+                    .and_then(|line| serde_json::from_slice::<HostReply>(&line)
-+                        .map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR".into()));
++                let result = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES).and_then(|line| {
++                    serde_json::from_slice::<HostReply>(&line)
++                        .map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR".into())
++                });
 +                let failed = result.is_err();
 +                if failed {
 +                    reader_health.store(false, Ordering::Release);
@@ -152,7 +175,9 @@ index 0000000..40391de
 +                    reader_health.store(false, Ordering::Release);
 +                    break;
 +                }
-+                if failed { break; }
++                if failed {
++                    break;
++                }
 +            }
 +        });
 +        let (request_tx, request_rx) = mpsc::sync_channel::<HostRequest>(8);
@@ -164,10 +189,13 @@ index 0000000..40391de
 +                    continue;
 +                }
 +                let result = (|| {
-+                    stdin.write_all(&request.line).and_then(|_| stdin.flush())
++                    stdin
++                        .write_all(&request.line)
++                        .and_then(|_| stdin.flush())
 +                        .map_err(|_| "CLOUD_WEB_DISCONNECTED".to_string())?;
 +                    let timeout = request.deadline.saturating_duration_since(Instant::now());
-+                    let response = response_rx.recv_timeout(timeout)
++                    let response = response_rx
++                        .recv_timeout(timeout)
 +                        .map_err(|_| "CLOUD_WEB_TIMEOUT".to_string())??;
 +                    if response.id != request.id {
 +                        return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
@@ -181,11 +209,17 @@ index 0000000..40391de
 +            }
 +        });
 +        Ok(Arc::new(Self {
-+            child: Mutex::new(Some(child)), requests: request_tx, healthy,
-+            ready: AtomicBool::new(false), input_enabled: AtomicBool::new(true),
-+            input_gate: Mutex::new(()), request_gate: Mutex::new(()),
-+            stop_epoch: AtomicU64::new(0), pending_releases: AtomicUsize::new(0),
-+            next_id: AtomicU64::new(1), session_id: session_id.into(),
++            child: Mutex::new(Some(child)),
++            requests: request_tx,
++            healthy,
++            ready: AtomicBool::new(false),
++            input_enabled: AtomicBool::new(true),
++            input_gate: Mutex::new(()),
++            request_gate: Mutex::new(()),
++            stop_epoch: AtomicU64::new(0),
++            pending_releases: AtomicUsize::new(0),
++            next_id: AtomicU64::new(1),
++            session_id: session_id.into(),
 +        }))
 +    }
 +
@@ -194,7 +228,9 @@ index 0000000..40391de
 +        let _guard = loop {
 +            match self.request_gate.try_lock() {
 +                Ok(guard) => break guard,
-+                Err(std::sync::TryLockError::Poisoned(_)) => return Err("CLOUD_WEB_PROTOCOL_ERROR".into()),
++                Err(std::sync::TryLockError::Poisoned(_)) => {
++                    return Err("CLOUD_WEB_PROTOCOL_ERROR".into())
++                }
 +                Err(std::sync::TryLockError::WouldBlock) => {
 +                    if Instant::now() >= deadline {
 +                        return Err("CLOUD_WEB_BUSY".into());
@@ -203,10 +239,19 @@ index 0000000..40391de
 +                }
 +            }
 +        };
-+        self.request_locked(method, params, deadline.saturating_duration_since(Instant::now()))
++        self.request_locked(
++            method,
++            params,
++            deadline.saturating_duration_since(Instant::now()),
++        )
 +    }
 +
-+    fn request_locked(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
++    fn request_locked(
++        &self,
++        method: &str,
++        params: Value,
++        timeout: Duration,
++    ) -> Result<Value, String> {
 +        if !self.healthy.load(Ordering::Acquire) {
 +            self.shutdown();
 +            return Err("CLOUD_WEB_DISCONNECTED".into());
@@ -219,7 +264,12 @@ index 0000000..40391de
 +            return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
 +        }
 +        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-+        let request = HostRequest { id, line, deadline: Instant::now() + timeout, reply: reply_tx };
++        let request = HostRequest {
++            id,
++            line,
++            deadline: Instant::now() + timeout,
++            reply: reply_tx,
++        };
 +        if self.requests.try_send(request).is_err() {
 +            self.shutdown();
 +            return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
@@ -231,7 +281,10 @@ index 0000000..40391de
 +                let _ = reply.error;
 +                Err("CLOUD_WEB_REJECTED".into())
 +            }
-+            Ok(Err(error)) => { self.shutdown(); Err(error) }
++            Ok(Err(error)) => {
++                self.shutdown();
++                Err(error)
++            }
 +            Err(_) => {
 +                // A timeout cannot retract input already dispatched. Kill the
 +                // session so queued/late commands cannot execute after failure.
@@ -242,11 +295,16 @@ index 0000000..40391de
 +    }
 +
 +    fn action(&self, method: &str, params: Value) -> bool {
-+        let Ok(_guard) = self.input_gate.lock() else { return false; };
++        let Ok(_guard) = self.input_gate.lock() else {
++            return false;
++        };
 +        if !self.input_enabled.load(Ordering::Acquire) && method != "inactive" {
 +            return false;
 +        }
-+        self.request(method, params, ACTION_TIMEOUT).ok().and_then(|v| v.as_bool()) == Some(true)
++        self.request(method, params, ACTION_TIMEOUT)
++            .ok()
++            .and_then(|v| v.as_bool())
++            == Some(true)
 +    }
 +
 +    /// Stop queued input without closing the page, so the next run can reuse it.
@@ -263,19 +321,29 @@ index 0000000..40391de
 +
 +    pub fn finish_stop_release(&self) -> bool {
 +        let result = match self.input_gate.lock() {
-+            Ok(_guard) => self.request("inactive", json!({}), ACTION_TIMEOUT)
-+                .ok().and_then(|v| v.as_bool()) == Some(true),
++            Ok(_guard) => {
++                self.request("inactive", json!({}), ACTION_TIMEOUT)
++                    .ok()
++                    .and_then(|v| v.as_bool())
++                    == Some(true)
++            }
 +            Err(_) => false,
 +        };
 +        self.pending_releases.fetch_sub(1, Ordering::AcqRel);
 +        result
 +    }
 +
-+    pub fn stop_epoch(&self) -> u64 { self.stop_epoch.load(Ordering::Acquire) }
++    pub fn stop_epoch(&self) -> u64 {
++        self.stop_epoch.load(Ordering::Acquire)
++    }
 +
 +    pub fn resume_input(&self) -> bool {
-+        let Ok(_guard) = self.input_gate.try_lock() else { return false; };
-+        if self.pending_releases.load(Ordering::Acquire) != 0 || !self.healthy.load(Ordering::Acquire) {
++        let Ok(_guard) = self.input_gate.try_lock() else {
++            return false;
++        };
++        if self.pending_releases.load(Ordering::Acquire) != 0
++            || !self.healthy.load(Ordering::Acquire)
++        {
 +            return false;
 +        }
 +        self.input_enabled.store(true, Ordering::Release);
@@ -284,10 +352,43 @@ index 0000000..40391de
 +
 +    pub fn shutdown(&self) {
 +        self.ready.store(false, Ordering::Release);
++        self.input_enabled.store(false, Ordering::Release);
++        // Normal idle shutdown gives Chromium time to persist login data.
++        // A failed/busy protocol still terminates immediately: pending input
++        // must not execute after a timeout. Do not call request() recursively.
++        let graceful = if let Ok(_gate) = self.request_gate.try_lock() {
++            if self.healthy.load(Ordering::Acquire) {
++                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
++                let (reply, result) = mpsc::sync_channel(1);
++                let line = format!("{{\"id\":{id},\"method\":\"shutdown\",\"params\":{{}}}}\n")
++                    .into_bytes();
++                self.requests
++                    .try_send(HostRequest {
++                        id,
++                        line,
++                        deadline: Instant::now() + Duration::from_secs(3),
++                        reply,
++                    })
++                    .is_ok()
++                    && matches!(result.recv_timeout(Duration::from_secs(3)), Ok(Ok(response)) if response.ok)
++            } else {
++                false
++            }
++        } else {
++            false
++        };
 +        self.healthy.store(false, Ordering::Release);
 +        if let Ok(mut guard) = self.child.lock() {
 +            if let Some(mut child) = guard.take() {
-+                let _ = child.kill();
++                if graceful {
++                    let deadline = Instant::now() + Duration::from_secs(5);
++                    while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
++                        std::thread::sleep(Duration::from_millis(25));
++                    }
++                }
++                if !matches!(child.try_wait(), Ok(Some(_))) {
++                    let _ = child.kill();
++                }
 +                let _ = child.wait();
 +            }
 +        }
@@ -295,24 +396,35 @@ index 0000000..40391de
 +}
 +
 +impl Drop for CloudWebSession {
-+    fn drop(&mut self) { self.shutdown(); }
++    fn drop(&mut self) {
++        self.shutdown();
++    }
 +}
 +
-+struct CloudWebCallback { session: Weak<CloudWebSession> }
++struct CloudWebCallback {
++    session: Weak<CloudWebSession>,
++}
 +
 +impl CloudWebCallback {
 +    fn action(&self, method: &str, params: Value) -> bool {
-+        self.session.upgrade().is_some_and(|session| session.action(method, params))
++        self.session
++            .upgrade()
++            .is_some_and(|session| session.action(method, params))
 +    }
 +}
 +
 +impl CustomControllerCallback for CloudWebCallback {
 +    fn connect(&self) -> bool {
 +        self.session.upgrade().is_some_and(|session| {
-+            let ready = session.request("connect", json!({}), CONNECT_TIMEOUT)
-+                .ok().and_then(|value| value.as_bool()) == Some(true);
++            let ready = session
++                .request("connect", json!({}), CONNECT_TIMEOUT)
++                .ok()
++                .and_then(|value| value.as_bool())
++                == Some(true);
 +            session.ready.store(ready, Ordering::Release);
-+            if !ready { session.shutdown(); }
++            if !ready {
++                session.shutdown();
++            }
 +            ready
 +        })
 +    }
@@ -334,41 +446,78 @@ index 0000000..40391de
 +                Err(std::sync::TryLockError::WouldBlock) => return true,
 +                Err(std::sync::TryLockError::Poisoned(_)) => return false,
 +            };
-+            session.request_locked("connected", json!({}), STATUS_TIMEOUT)
-+                .ok().and_then(|value| value.as_bool()) == Some(true)
++            session
++                .request_locked("connected", json!({}), STATUS_TIMEOUT)
++                .ok()
++                .and_then(|value| value.as_bool())
++                == Some(true)
 +        })
 +    }
 +    fn request_uuid(&self) -> Option<String> {
-+        self.session.upgrade().map(|session| format!("cloudweb:{}", session.session_id))
++        self.session
++            .upgrade()
++            .map(|session| format!("cloudweb:{}", session.session_id))
 +    }
 +    fn screencap(&self) -> Option<Vec<u8>> {
 +        let session = self.session.upgrade()?;
-+        let value = session.request("screencap", json!({}), ACTION_TIMEOUT).ok()?;
++        let value = session
++            .request("screencap", json!({}), ACTION_TIMEOUT)
++            .ok()?;
 +        let data = STANDARD.decode(value.as_str()?).ok()?;
-+        if !valid_viewport_png(&data) { return None; }
++        if !valid_viewport_png(&data) {
++            return None;
++        }
 +        Some(data)
 +    }
-+    fn click(&self, x: i32, y: i32) -> bool { self.action("click", json!({"x":x,"y":y})) }
++    fn click(&self, x: i32, y: i32) -> bool {
++        self.action("click", json!({"x":x,"y":y}))
++    }
 +    fn swipe(&self, x1: i32, y1: i32, x2: i32, y2: i32, duration: i32) -> bool {
-+        self.action("swipe", json!({"x1":x1,"y1":y1,"x2":x2,"y2":y2,"duration":duration}))
++        self.action(
++            "swipe",
++            json!({"x1":x1,"y1":y1,"x2":x2,"y2":y2,"duration":duration}),
++        )
 +    }
 +    fn touch_down(&self, contact: i32, x: i32, y: i32, pressure: i32) -> bool {
-+        self.action("touch_down", json!({"contact":contact,"x":x,"y":y,"pressure":pressure}))
++        self.action(
++            "touch_down",
++            json!({"contact":contact,"x":x,"y":y,"pressure":pressure}),
++        )
 +    }
 +    fn touch_move(&self, contact: i32, x: i32, y: i32, pressure: i32) -> bool {
-+        self.action("touch_move", json!({"contact":contact,"x":x,"y":y,"pressure":pressure}))
++        self.action(
++            "touch_move",
++            json!({"contact":contact,"x":x,"y":y,"pressure":pressure}),
++        )
 +    }
-+    fn touch_up(&self, contact: i32) -> bool { self.action("touch_up", json!({"contact":contact})) }
-+    fn click_key(&self, keycode: i32) -> bool { self.action("click_key", json!({"keycode":keycode})) }
-+    fn key_down(&self, keycode: i32) -> bool { self.action("key_down", json!({"keycode":keycode})) }
-+    fn key_up(&self, keycode: i32) -> bool { self.action("key_up", json!({"keycode":keycode})) }
-+    fn input_text(&self, text: &str) -> bool { self.action("input_text", json!({"text":text})) }
-+    fn scroll(&self, dx: i32, dy: i32) -> bool { self.action("scroll", json!({"dx":dx,"dy":dy})) }
-+    fn relative_move(&self, dx: i32, dy: i32) -> bool { self.action("relative_move", json!({"dx":dx,"dy":dy})) }
-+    fn inactive(&self) -> bool { self.action("inactive", json!({})) }
++    fn touch_up(&self, contact: i32) -> bool {
++        self.action("touch_up", json!({"contact":contact}))
++    }
++    fn click_key(&self, keycode: i32) -> bool {
++        self.action("click_key", json!({"keycode":keycode}))
++    }
++    fn key_down(&self, keycode: i32) -> bool {
++        self.action("key_down", json!({"keycode":keycode}))
++    }
++    fn key_up(&self, keycode: i32) -> bool {
++        self.action("key_up", json!({"keycode":keycode}))
++    }
++    fn input_text(&self, text: &str) -> bool {
++        self.action("input_text", json!({"text":text}))
++    }
++    fn scroll(&self, dx: i32, dy: i32) -> bool {
++        self.action("scroll", json!({"dx":dx,"dy":dy}))
++    }
++    fn relative_move(&self, dx: i32, dy: i32) -> bool {
++        self.action("relative_move", json!({"dx":dx,"dy":dy}))
++    }
++    fn inactive(&self) -> bool {
++        self.action("inactive", json!({}))
++    }
 +    fn get_info(&self) -> String {
 +        json!({"type":"cloudweb", "controller_type":"CloudWeb", "backend":"QtWebEngine",
-+            "input_coordinate_space":"1280x720", "pointer_lock_supported":false}).to_string()
++            "input_coordinate_space":"1280x720", "pointer_lock_supported":false})
++        .to_string()
 +    }
 +}
 +
@@ -403,23 +552,42 @@ index 0000000..40391de
 +}
 +
 +fn valid_viewport_png(data: &[u8]) -> bool {
-+    data.len() >= 33 && data.len() <= MAX_RESPONSE_BYTES
-+        && &data[..8] == b"\x89PNG\r\n\x1a\n" && &data[12..16] == b"IHDR"
-+        && u32::from_be_bytes([data[16],data[17],data[18],data[19]]) == 1280
-+        && u32::from_be_bytes([data[20],data[21],data[22],data[23]]) == 720
++    data.len() >= 33
++        && data.len() <= MAX_RESPONSE_BYTES
++        && &data[..8] == b"\x89PNG\r\n\x1a\n"
++        && &data[12..16] == b"IHDR"
++        && u32::from_be_bytes([data[16], data[17], data[18], data[19]]) == 1280
++        && u32::from_be_bytes([data[20], data[21], data[22], data[23]]) == 720
 +}
 +
-+pub fn create_controller(url: &str, session_id: &str) -> Result<(Controller, Arc<CloudWebSession>), String> {
++pub fn create_controller(
++    url: &str,
++    session_id: &str,
++) -> Result<(Controller, Arc<CloudWebSession>), String> {
++    let session = open_browser(url, session_id)?;
++    let controller = controller_for_session(&session)?;
++    Ok((controller, session))
++}
++
++pub fn open_browser(url: &str, session_id: &str) -> Result<Arc<CloudWebSession>, String> {
 +    #[cfg(windows)]
 +    if super::system::is_elevated() && !url.is_empty() && url != "bundled-fixture" {
 +        return Err("CLOUD_WEB_ELEVATED".into());
 +    }
 +    let root = super::utils::get_exe_directory().map_err(|_| "CLOUD_WEB_HOST_MISSING")?;
-+    let name = if cfg!(windows) { "CloudWebHost.exe" } else { "CloudWebHost" };
-+    let session = CloudWebSession::spawn(&root.join("cloudweb-host").join(name), url, session_id)?;
-+    let callback = CloudWebCallback { session: Arc::downgrade(&session) };
-+    let controller = Controller::new_custom(GuardedCallback(callback)).map_err(|_| "CLOUD_WEB_CREATE_FAILED")?;
-+    Ok((controller, session))
++    let name = if cfg!(windows) {
++        "CloudWebHost.exe"
++    } else {
++        "CloudWebHost"
++    };
++    CloudWebSession::spawn(&root.join("cloudweb-host").join(name), url, session_id)
++}
++
++pub fn controller_for_session(session: &Arc<CloudWebSession>) -> Result<Controller, String> {
++    let callback = CloudWebCallback {
++        session: Arc::downgrade(session),
++    };
++    Controller::new_custom(GuardedCallback(callback)).map_err(|_| "CLOUD_WEB_CREATE_FAILED".into())
 +}
 +
 +/// Packaged, offline verification entrypoint. This deliberately uses the same
@@ -427,27 +595,45 @@ index 0000000..40391de
 +/// It does not load Python Maa bindings or start a second automation engine.
 +pub fn run_fixture_smoke(report_path: &Path) -> Result<(), String> {
 +    let root = super::utils::get_exe_directory()?;
-+    let output = report_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
++    let output = report_path
++        .parent()
++        .filter(|path| !path.as_os_str().is_empty())
++        .unwrap_or(Path::new("."));
 +    std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
 +    let result = (|| -> Result<Value, String> {
 +        let lib_dir = root.join("maafw");
 +        #[cfg(windows)]
 +        {
-+            winsafe::SetDllDirectory(Some(&lib_dir.to_string_lossy())).map_err(|e| e.to_string())?;
++            winsafe::SetDllDirectory(Some(&lib_dir.to_string_lossy()))
++                .map_err(|e| e.to_string())?;
 +        }
-+        let library_name = if cfg!(windows) { "MaaFramework.dll" }
-+            else if cfg!(target_os = "macos") { "libMaaFramework.dylib" }
-+            else { "libMaaFramework.so" };
++        let library_name = if cfg!(windows) {
++            "MaaFramework.dll"
++        } else if cfg!(target_os = "macos") {
++            "libMaaFramework.dylib"
++        } else {
++            "libMaaFramework.so"
++        };
 +        maa_framework::load_library(&lib_dir.join(library_name))?;
 +        let (controller, session) = create_controller("bundled-fixture", "native-fixture-smoke")?;
-+        controller.set_screenshot_target_short_side(720).map_err(|e| e.to_string())?;
++        controller
++            .set_screenshot_target_short_side(720)
++            .map_err(|e| e.to_string())?;
 +        let connection = controller.post_connection().map_err(|e| e.to_string())?;
 +        wait_for_success(|| controller.status(connection), CONNECT_TIMEOUT, "connect")?;
-+        if !controller.connected() { return Err("Native controller did not connect".into()); }
++        if !controller.connected() {
++            return Err("Native controller did not connect".into());
++        }
 +
 +        let resource = maa_framework::resource::Resource::new().map_err(|e| e.to_string())?;
-+        let load = resource.post_bundle(&root.join("resource").to_string_lossy()).map_err(|e| e.to_string())?;
-+        wait_for_success(|| load.status(), Duration::from_secs(60), "load shipped resource")?;
++        let load = resource
++            .post_bundle(&root.join("resource").to_string_lossy())
++            .map_err(|e| e.to_string())?;
++        wait_for_success(
++            || load.status(),
++            Duration::from_secs(60),
++            "load shipped resource",
++        )?;
 +        let pipeline = json!({
 +            "CloudWebFixtureClick": {"recognition":"DirectHit", "action":"Click", "target":[250,360,1,1],
 +                "next":["CloudWebFixtureGreen"]},
@@ -465,65 +651,126 @@ index 0000000..40391de
 +                "roi":[20,650,20,20], "lower":[[255,255,255]], "upper":[[255,255,255]], "count":300,
 +                "action":"DoNothing", "timeout":60000}
 +        });
-+        resource.override_pipeline(&pipeline.to_string()).map_err(|e| e.to_string())?;
++        resource
++            .override_pipeline(&pipeline.to_string())
++            .map_err(|e| e.to_string())?;
 +        let tasker = maa_framework::tasker::Tasker::new().map_err(|e| e.to_string())?;
-+        tasker.bind(&resource, &controller).map_err(|e| e.to_string())?;
-+        if !tasker.inited() { return Err("Native Tasker was not initialized".into()); }
++        tasker
++            .bind(&resource, &controller)
++            .map_err(|e| e.to_string())?;
++        if !tasker.inited() {
++            return Err("Native Tasker was not initialized".into());
++        }
 +
-+        let first = tasker.post_task("CloudWebFixtureClick", "{}").map_err(|e| e.to_string())?;
-+        wait_for_success(|| first.status(), Duration::from_secs(30), "first native Tasker click and pixel recognition")?;
++        let first = tasker
++            .post_task("CloudWebFixtureClick", "{}")
++            .map_err(|e| e.to_string())?;
++        wait_for_success(
++            || first.status(),
++            Duration::from_secs(30),
++            "first native Tasker click and pixel recognition",
++        )?;
 +        save_native_screenshot(&controller, &output.join("native-tasker-first.png"))?;
 +
-+        let hold = tasker.post_task("CloudWebFixtureHold", "{}").map_err(|e| e.to_string())?;
++        let hold = tasker
++            .post_task("CloudWebFixtureHold", "{}")
++            .map_err(|e| e.to_string())?;
 +        let start = Instant::now();
-+        while hold.status() == maa_framework::MaaStatus::PENDING && start.elapsed() < Duration::from_secs(5) {
++        while hold.status() == maa_framework::MaaStatus::PENDING
++            && start.elapsed() < Duration::from_secs(5)
++        {
 +            std::thread::sleep(Duration::from_millis(10));
 +        }
 +        let stop_id = tasker.post_stop().map_err(|e| e.to_string())?;
-+        if !session.pause_and_release_input() { return Err("Held-input release failed".into()); }
++        if !session.pause_and_release_input() {
++            return Err("Held-input release failed".into());
++        }
 +        wait_for_success(
-+            || maa_framework::MaaStatus(unsafe { maa_framework::sys::MaaTaskerStatus(tasker.raw(), stop_id) }),
-+            Duration::from_secs(20), "native Tasker stop",
++            || {
++                maa_framework::MaaStatus(unsafe {
++                    maa_framework::sys::MaaTaskerStatus(tasker.raw(), stop_id)
++                })
++            },
++            Duration::from_secs(20),
++            "native Tasker stop",
 +        )?;
-+        if !controller.connected() { return Err("Stop unexpectedly destroyed the browser".into()); }
-+        if !session.resume_input() { return Err("Could not resume released input".into()); }
-+        let second = tasker.post_task("CloudWebFixtureSecondClick", "{}").map_err(|e| e.to_string())?;
-+        wait_for_success(|| second.status(), Duration::from_secs(30), "second native Tasker click and pixel recognition")?;
++        if !controller.connected() {
++            return Err("Stop unexpectedly destroyed the browser".into());
++        }
++        if !session.resume_input() {
++            return Err("Could not resume released input".into());
++        }
++        let second = tasker
++            .post_task("CloudWebFixtureSecondClick", "{}")
++            .map_err(|e| e.to_string())?;
++        wait_for_success(
++            || second.status(),
++            Duration::from_secs(30),
++            "second native Tasker click and pixel recognition",
++        )?;
 +        save_native_screenshot(&controller, &output.join("native-tasker-restarted.png"))?;
 +        let inactive = controller.post_inactive().map_err(|e| e.to_string())?;
 +        wait_for_success(|| controller.status(inactive), ACTION_TIMEOUT, "inactive")?;
 +
 +        // Destroy the native engine before reaping its view. A subsequent status
 +        // request must fail closed rather than consume a stale screenshot.
-+        drop(first); drop(hold); drop(second); drop(tasker); drop(resource); drop(controller);
++        drop(first);
++        drop(hold);
++        drop(second);
++        drop(tasker);
++        drop(resource);
++        drop(controller);
 +        session.shutdown();
-+        let reaped = session.child.lock().map_err(|_| "child mutex poisoned")?.is_none();
-+        if !reaped { return Err("Browser child was not reaped".into()); }
-+        Ok(json!({"result":"passed", "engine":"MXU Rust MaaFramework Tasker", "offline_only":true,
++        let reaped = session
++            .child
++            .lock()
++            .map_err(|_| "child mutex poisoned")?
++            .is_none();
++        if !reaped {
++            return Err("Browser child was not reaped".into());
++        }
++        Ok(
++            json!({"result":"passed", "engine":"MXU Rust MaaFramework Tasker", "offline_only":true,
 +            "resource":"shipped resource bundle", "native_tasker_bound":true,
 +            "first_click_pixel_verified":true, "stopped_without_closing_browser":true,
 +            "restarted_click_pixel_verified":true, "child_reaped":true,
 +            "screenshots":["native-tasker-first.png","native-tasker-restarted.png"],
-+            "cloud_game_verified":false, "pointer_lock_verified":false}))
++            "cloud_game_verified":false, "pointer_lock_verified":false}),
++        )
 +    })();
 +    let report = match &result {
 +        Ok(value) => value.clone(),
-+        Err(error) => json!({"result":"failed", "engine":"MXU Rust MaaFramework Tasker", "error":error}),
++        Err(error) => {
++            json!({"result":"failed", "engine":"MXU Rust MaaFramework Tasker", "error":error})
++        }
 +    };
-+    std::fs::write(report_path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
-+        .map_err(|e| e.to_string())?;
++    std::fs::write(
++        report_path,
++        serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?,
++    )
++    .map_err(|e| e.to_string())?;
 +    result.map(|_| ())
 +}
 +
-+fn wait_for_success(mut status: impl FnMut() -> maa_framework::MaaStatus, timeout: Duration, stage: &str) -> Result<(), String> {
++fn wait_for_success(
++    mut status: impl FnMut() -> maa_framework::MaaStatus,
++    timeout: Duration,
++    stage: &str,
++) -> Result<(), String> {
 +    let start = Instant::now();
 +    loop {
 +        let current = status();
-+        if current == maa_framework::MaaStatus::SUCCEEDED { return Ok(()); }
-+        if current == maa_framework::MaaStatus::FAILED || current == maa_framework::MaaStatus::INVALID {
++        if current == maa_framework::MaaStatus::SUCCEEDED {
++            return Ok(());
++        }
++        if current == maa_framework::MaaStatus::FAILED
++            || current == maa_framework::MaaStatus::INVALID
++        {
 +            return Err(format!("Native CloudWeb smoke failed: {stage}"));
 +        }
-+        if start.elapsed() >= timeout { return Err(format!("Native CloudWeb smoke timed out: {stage}")); }
++        if start.elapsed() >= timeout {
++            return Err(format!("Native CloudWeb smoke timed out: {stage}"));
++        }
 +        std::thread::sleep(Duration::from_millis(20));
 +    }
 +}
@@ -531,9 +778,14 @@ index 0000000..40391de
 +fn save_native_screenshot(controller: &Controller, path: &Path) -> Result<(), String> {
 +    let id = controller.post_screencap().map_err(|e| e.to_string())?;
 +    wait_for_success(|| controller.status(id), ACTION_TIMEOUT, "screenshot")?;
-+    let data = controller.cached_image().map_err(|e| e.to_string())?.to_vec()
++    let data = controller
++        .cached_image()
++        .map_err(|e| e.to_string())?
++        .to_vec()
 +        .ok_or("Native screenshot buffer was empty")?;
-+    if !valid_viewport_png(&data) { return Err("Native screenshot had incorrect geometry".into()); }
++    if !valid_viewport_png(&data) {
++        return Err("Native screenshot had incorrect geometry".into());
++    }
 +    std::fs::write(path, data).map_err(|e| e.to_string())
 +}
 +
@@ -543,13 +795,22 @@ index 0000000..40391de
 +
 +    fn mock_session() -> (Arc<CloudWebSession>, mpsc::Receiver<HostRequest>) {
 +        let (requests, receiver) = mpsc::sync_channel(8);
-+        (Arc::new(CloudWebSession {
-+            child: Mutex::new(None), requests, healthy: Arc::new(AtomicBool::new(true)),
-+            ready: AtomicBool::new(true), input_enabled: AtomicBool::new(true),
-+            input_gate: Mutex::new(()), request_gate: Mutex::new(()),
-+            stop_epoch: AtomicU64::new(0), pending_releases: AtomicUsize::new(0),
-+            next_id: AtomicU64::new(1), session_id: "test".into(),
-+        }), receiver)
++        (
++            Arc::new(CloudWebSession {
++                child: Mutex::new(None),
++                requests,
++                healthy: Arc::new(AtomicBool::new(true)),
++                ready: AtomicBool::new(true),
++                input_enabled: AtomicBool::new(true),
++                input_gate: Mutex::new(()),
++                request_gate: Mutex::new(()),
++                stop_epoch: AtomicU64::new(0),
++                pending_releases: AtomicUsize::new(0),
++                next_id: AtomicU64::new(1),
++                session_id: "test".into(),
++            }),
++            receiver,
++        )
 +    }
 +
 +    #[test]
@@ -558,12 +819,22 @@ index 0000000..40391de
 +        let call_session = session.clone();
 +        let action = std::thread::spawn(move || call_session.action("swipe", json!({})));
 +        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
-+        let callback = CloudWebCallback { session: Arc::downgrade(&session) };
++        let callback = CloudWebCallback {
++            session: Arc::downgrade(&session),
++        };
 +        let before = Instant::now();
 +        assert!(callback.connected());
 +        assert!(before.elapsed() < Duration::from_millis(200));
 +        assert!(session.healthy.load(Ordering::Acquire));
-+        request.reply.send(Ok(HostReply { id: request.id, ok: true, result: json!(true), error: None })).unwrap();
++        request
++            .reply
++            .send(Ok(HostReply {
++                id: request.id,
++                ok: true,
++                result: json!(true),
++                error: None,
++            }))
++            .unwrap();
 +        assert!(action.join().unwrap());
 +    }
 +
@@ -578,7 +849,15 @@ index 0000000..40391de
 +        let release = std::thread::spawn(move || releasing.finish_stop_release());
 +        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
 +        assert!(!session.resume_input());
-+        request.reply.send(Ok(HostReply { id: request.id, ok: true, result: json!(true), error: None })).unwrap();
++        request
++            .reply
++            .send(Ok(HostReply {
++                id: request.id,
++                ok: true,
++                result: json!(true),
++                error: None,
++            }))
++            .unwrap();
 +        assert!(release.join().unwrap());
 +        assert!(session.resume_input());
 +    }
@@ -598,13 +877,22 @@ index 0000000..40391de
 +    #[test]
 +    fn response_timeout_faults_session() {
 +        let (session, _requests) = mock_session();
-+        assert!(session.request("screencap", json!({}), Duration::from_millis(10)).is_err());
++        assert!(session
++            .request("screencap", json!({}), Duration::from_millis(10))
++            .is_err());
 +        assert!(!session.healthy.load(Ordering::Acquire));
 +    }
 +
 +    #[test]
 +    fn url_policy_rejects_privileged_and_credential_urls() {
-+        for url in ["http://example.com", "file:///tmp/test", "https://u:p@example.com", "https://example.com:123", "https://example.com/\nsecret", "https://example.com\\@other.com"] {
++        for url in [
++            "http://example.com",
++            "file:///tmp/test",
++            "https://u:p@example.com",
++            "https://example.com:123",
++            "https://example.com/\nsecret",
++            "https://example.com\\@other.com",
++        ] {
 +            assert!(normalized_url(url).is_err(), "{url}");
 +        }
 +        assert_eq!(normalized_url("").unwrap(), "bundled-fixture");
@@ -613,7 +901,10 @@ index 0000000..40391de
 +
 +    #[test]
 +    fn protocol_line_is_bounded_and_requires_newline() {
-+        assert_eq!(read_bounded_line(&mut &b"{}\nremaining"[..], 3).unwrap(), b"{}\n");
++        assert_eq!(
++            read_bounded_line(&mut &b"{}\nremaining"[..], 3).unwrap(),
++            b"{}\n"
++        );
 +        assert!(read_bounded_line(&mut &b"1234\n"[..], 4).is_err());
 +        assert!(read_bounded_line(&mut &b"{}"[..], 10).is_err());
 +    }
@@ -631,7 +922,7 @@ index 0000000..40391de
 +    }
 +}
 diff --git a/src-tauri/src/commands/maa_agent.rs b/src-tauri/src/commands/maa_agent.rs
-index d276381..10e071d 100644
+index d276381..3c57858 100644
 --- a/src-tauri/src/commands/maa_agent.rs
 +++ b/src-tauri/src/commands/maa_agent.rs
 @@ -532,7 +532,7 @@ pub async fn start_tasks_impl(
@@ -643,7 +934,7 @@ index d276381..10e071d 100644
          debug!("[start_tasks] Acquiring instances lock...");
          let mut instances = maa_state.instances.lock().map_err(|e| e.to_string())?;
          debug!("[start_tasks] Instances lock acquired");
-@@ -555,6 +555,15 @@ pub async fn start_tasks_impl(
+@@ -555,6 +555,17 @@ pub async fn start_tasks_impl(
              .clone();
          debug!("[start_tasks] Controller acquired");
  
@@ -651,7 +942,9 @@ index d276381..10e071d 100644
 +            if instance.stop_in_progress && instance.tasker.as_ref().is_some_and(|t| t.running()) {
 +                return Err("CLOUD_WEB_BUSY".into());
 +            }
-+            if !session.resume_input() { return Err("CLOUD_WEB_BUSY".into()); }
++            if !session.resume_input() {
++                return Err("CLOUD_WEB_BUSY".into());
++            }
 +            instance.stop_in_progress = false;
 +            instance.stop_started_at = None;
 +        }
@@ -659,23 +952,29 @@ index d276381..10e071d 100644
          // 创建或获取 tasker（若已有 tasker 但未初始化则自动丢弃并重建）
          let needs_new_tasker = match instance.tasker.as_ref() {
              None => true,
-@@ -613,7 +622,8 @@ pub async fn start_tasks_impl(
+@@ -613,7 +624,11 @@ pub async fn start_tasks_impl(
          }
  
          let t = instance.tasker.as_ref().unwrap().clone();
 -        (res, ctrl, t)
-+        let cloud_web_run = instance.cloud_web_session.as_ref().map(|session| (session.clone(), session.stop_epoch()));
++        let cloud_web_run = instance
++            .cloud_web_session
++            .as_ref()
++            .map(|session| (session.clone(), session.stop_epoch()));
 +        (res, ctrl, t, cloud_web_run)
      };
      debug!("[start_tasks] Resource, controller and tasker acquired, proceeding...");
  
-@@ -726,6 +736,14 @@ pub async fn start_tasks_impl(
+@@ -726,6 +741,17 @@ pub async fn start_tasks_impl(
          let instance = instances
              .get_mut(&instance_id)
              .ok_or("Instance not found")?;
 +        if let Some((session, epoch)) = &cloud_web_run {
 +            if session.stop_epoch() != *epoch
-+                || !instance.cloud_web_session.as_ref().is_some_and(|current| Arc::ptr_eq(current, session))
++                || !instance
++                    .cloud_web_session
++                    .as_ref()
++                    .is_some_and(|current| Arc::ptr_eq(current, session))
 +                || instance.stop_in_progress
 +            {
 +                return Err("CLOUD_WEB_BUSY".into());
@@ -685,10 +984,10 @@ index d276381..10e071d 100644
              // 首批：重置任务运行状态
              instance.task_ids.clear();
 diff --git a/src-tauri/src/commands/maa_core.rs b/src-tauri/src/commands/maa_core.rs
-index c32d227..d3b02c9 100644
+index c32d227..ffa587f 100644
 --- a/src-tauri/src/commands/maa_core.rs
 +++ b/src-tauri/src/commands/maa_core.rs
-@@ -322,24 +322,41 @@ fn update_instance_controller(
+@@ -322,24 +322,44 @@ fn update_instance_controller(
      instance_id: &str,
      controller: maa_framework::controller::Controller,
      new_config: super::types::ControllerConfig,
@@ -702,7 +1001,10 @@ index c32d227..d3b02c9 100644
 +        // Recheck after asynchronous host startup, under the replacement lock.
 +        // Also covers switching FROM CloudWeb to another controller type.
 +        if (instance.cloud_web_session.is_some() || cloud_web_session.is_some())
-+            && instance.tasker.as_ref().is_some_and(|tasker| tasker.running())
++            && instance
++                .tasker
++                .as_ref()
++                .is_some_and(|tasker| tasker.running())
 +        {
 +            return Err("CLOUD_WEB_RECONNECT_RUNNING".into());
 +        }
@@ -735,7 +1037,7 @@ index c32d227..d3b02c9 100644
      if let Some(old_cfg) = cleanup_config {
          if let Ok(mut pool) = state.controller_pool.lock() {
              pool.remove(&old_cfg);
-@@ -741,14 +758,14 @@ pub fn maa_create_instance(state: State<Arc<MaaState>>, instance_id: String) ->
+@@ -741,14 +761,14 @@ pub fn maa_create_instance(state: State<Arc<MaaState>>, instance_id: String) ->
  pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result<(), String> {
      info!("destroy_instance_impl called, instance_id: {}", instance_id);
  
@@ -753,7 +1055,7 @@ index c32d227..d3b02c9 100644
              info!(
                  "destroy_instance_impl success, instance_id: {}",
                  instance_id
-@@ -764,8 +781,10 @@ pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result
+@@ -764,8 +784,10 @@ pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result
                  instance_id
              );
              None
@@ -765,7 +1067,7 @@ index c32d227..d3b02c9 100644
  
      // ControllerPool: 清理不再被任何实例使用的条目
      if let Some(cfg) = cleanup_config {
-@@ -806,8 +825,19 @@ pub async fn connect_controller_impl(
+@@ -806,8 +828,23 @@ pub async fn connect_controller_impl(
      on_event: Arc<dyn Fn(&str, &str) + Send + Sync + 'static>,
  ) -> Result<i64, String> {
      tokio::task::spawn_blocking(move || {
@@ -773,7 +1075,11 @@ index c32d227..d3b02c9 100644
 +        if is_cloud_web {
 +            let instances = state_arc.instances.lock().map_err(|e| e.to_string())?;
 +            let instance = instances.get(&instance_id).ok_or("Instance not found")?;
-+            if instance.tasker.as_ref().is_some_and(|tasker| tasker.running()) {
++            if instance
++                .tasker
++                .as_ref()
++                .is_some_and(|tasker| tasker.running())
++            {
 +                return Err("CLOUD_WEB_RECONNECT_RUNNING".into());
 +            }
 +        }
@@ -786,7 +1092,7 @@ index c32d227..d3b02c9 100644
              let pool = state_arc
                  .controller_pool
                  .lock()
-@@ -823,7 +853,7 @@ pub async fn connect_controller_impl(
+@@ -823,7 +860,7 @@ pub async fn connect_controller_impl(
  
              let conn_id = next_synthetic_conn_id();
  
@@ -795,7 +1101,7 @@ index c32d227..d3b02c9 100644
  
              // 发送合成回调事件，前端无感知
              let details = format!(r#"{{"ctrl_id":{},"action":"Connect"}}"#, conn_id);
-@@ -842,12 +872,19 @@ pub async fn connect_controller_impl(
+@@ -842,12 +879,54 @@ pub async fn connect_controller_impl(
              pool.remove(&config);
          }
  
@@ -806,20 +1112,55 @@ index c32d227..d3b02c9 100644
 +        if is_cloud_web {
 +            info!("Creating an instance-owned CloudWeb controller");
 +        } else {
-+            info!("ControllerPool miss: creating new controller for {:?}", config);
++            info!(
++                "ControllerPool miss: creating new controller for {:?}",
++                config
++            );
 +        }
  
 +        let mut cloud_web_session = None;
          let controller = match &config {
 +            ControllerConfig::CloudWeb { url, session_id } => {
-+                let (controller, session) = super::cloud_web::create_controller(url, session_id)?;
++                let existing = {
++                    let mut instances = state_arc.instances.lock().map_err(|e| e.to_string())?;
++                    let instance = instances
++                        .get_mut(&instance_id)
++                        .ok_or("Instance not found")?;
++                    if instance.controller_config.as_ref() == Some(&config)
++                        && instance
++                            .cloud_web_session
++                            .as_ref()
++                            .is_some_and(|session| session.is_healthy())
++                    {
++                        instance.cloud_web_session.clone()
++                    } else {
++                        None
++                    }
++                };
++                let (controller, session) = if let Some(session) = existing {
++                    (super::cloud_web::controller_for_session(&session)?, session)
++                } else {
++                    let old = {
++                        let mut instances =
++                            state_arc.instances.lock().map_err(|e| e.to_string())?;
++                        instances
++                            .get_mut(&instance_id)
++                            .ok_or("Instance not found")?
++                            .cloud_web_session
++                            .take()
++                    };
++                    if let Some(old) = old {
++                        old.shutdown();
++                    }
++                    super::cloud_web::create_controller(url, session_id)?
++                };
 +                cloud_web_session = Some(session);
 +                controller
 +            }
              ControllerConfig::Adb {
                  adb_path,
                  address,
-@@ -1025,6 +1062,7 @@ pub async fn connect_controller_impl(
+@@ -1025,6 +1104,7 @@ pub async fn connect_controller_impl(
              .map_err(|e| e.to_string())?;
  
          let display_short_side = match &config {
@@ -827,7 +1168,7 @@ index c32d227..d3b02c9 100644
              ControllerConfig::Adb {
                  display_short_side, ..
              }
-@@ -1059,7 +1097,7 @@ pub async fn connect_controller_impl(
+@@ -1059,7 +1139,7 @@ pub async fn connect_controller_impl(
          let conn_id = controller.post_connection().map_err(|e| e.to_string())?;
  
          // 存入 ControllerPool
@@ -836,16 +1177,81 @@ index c32d227..d3b02c9 100644
              let mut pool = state_arc
                  .controller_pool
                  .lock()
-@@ -1069,7 +1107,7 @@ pub async fn connect_controller_impl(
+@@ -1069,7 +1149,13 @@ pub async fn connect_controller_impl(
  
          // 更新实例状态
          debug!("Updating instance state...");
 -        update_instance_controller(&state_arc, &instance_id, controller, config)?;
-+        update_instance_controller(&state_arc, &instance_id, controller, config, cloud_web_session)?;
++        update_instance_controller(
++            &state_arc,
++            &instance_id,
++            controller,
++            config,
++            cloud_web_session,
++        )?;
  
          Ok(conn_id)
      })
-@@ -1374,6 +1412,15 @@ pub fn run_task_impl(
+@@ -1119,6 +1205,58 @@ mod tests {
+ 
+ /// 连接控制器（异步，通过回调通知完成状态）
+ /// 返回连接请求 ID，前端通过监听 maa-callback 事件获取完成状态
++/// Open the login browser without connecting or starting the user's task list.
++#[tauri::command]
++pub async fn maa_cloud_web_login(
++    state: State<'_, Arc<MaaState>>,
++    instance_id: String,
++    url: String,
++) -> Result<(), String> {
++    let state = state.inner().clone();
++    tokio::task::spawn_blocking(move || {
++        let config = ControllerConfig::CloudWeb {
++            url: url.clone(),
++            session_id: instance_id.clone(),
++        };
++        let old = {
++            let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
++            let instance = instances
++                .get_mut(&instance_id)
++                .ok_or("Instance not found")?;
++            if instance
++                .tasker
++                .as_ref()
++                .is_some_and(|tasker| tasker.running())
++                || instance.controller.is_some()
++            {
++                return Err("CLOUD_WEB_RECONNECT_RUNNING".to_string());
++            }
++            if instance.controller_config.as_ref() == Some(&config)
++                && instance
++                    .cloud_web_session
++                    .as_ref()
++                    .is_some_and(|session| session.is_healthy())
++            {
++                return Ok(());
++            }
++            instance.cloud_web_session.take()
++        };
++        if let Some(old) = old {
++            old.shutdown();
++        }
++        let session = super::cloud_web::open_browser(&url, &instance_id)?;
++        let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
++        let instance = instances
++            .get_mut(&instance_id)
++            .ok_or("Instance not found")?;
++        instance.cloud_web_session = Some(session);
++        instance.controller_config = Some(config);
++        Ok(())
++    })
++    .await
++    .map_err(|e| e.to_string())?
++}
++
+ #[tauri::command]
+ pub async fn maa_connect_controller(
+     app: tauri::AppHandle,
+@@ -1374,6 +1512,17 @@ pub fn run_task_impl(
          return Err("Tasker not initialized even after rebuild".to_string());
      }
  
@@ -853,7 +1259,9 @@ index c32d227..d3b02c9 100644
 +        if instance.stop_in_progress && tasker.running() {
 +            return Err("CLOUD_WEB_BUSY".into());
 +        }
-+        if !session.resume_input() { return Err("CLOUD_WEB_BUSY".into()); }
++        if !session.resume_input() {
++            return Err("CLOUD_WEB_BUSY".into());
++        }
 +        instance.stop_in_progress = false;
 +        instance.stop_started_at = None;
 +    }
@@ -861,13 +1269,15 @@ index c32d227..d3b02c9 100644
      let job = tasker
          .post_task(entry, pipeline_override)
          .map_err(|e| e.to_string())?;
-@@ -1494,7 +1541,16 @@ pub fn stop_task_impl(state: &MaaState, instance_id: &str) -> Result<(), String>
+@@ -1494,7 +1643,18 @@ pub fn stop_task_impl(state: &MaaState, instance_id: &str) -> Result<(), String>
      // 遥测：用户取消，以 cancelled 结束当前运行的 Transaction（幂等，仅首次生效）
      super::telemetry::on_run_cancelled(instance_id);
  
 -    tasker.post_stop().map_err(|e| e.to_string())?;
 +    let cloud_web_session = instance.cloud_web_session.clone();
-+    if let Some(session) = &cloud_web_session { session.begin_stop(); }
++    if let Some(session) = &cloud_web_session {
++        session.begin_stop();
++    }
 +    let stop_result = tasker.post_stop().map_err(|e| e.to_string());
 +    drop(instances);
 +    if let Some(session) = cloud_web_session {
@@ -953,10 +1363,18 @@ index abe9de5..45bab2e 100644
      pub fn cleanup_all_agent_children(&self) {
          if let Ok(mut instances) = self.instances.lock() {
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index 444a547..cb85f4e 100644
+index 444a547..471071e 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
-@@ -331,6 +331,7 @@ pub fn run() {
+@@ -228,6 +228,7 @@ pub fn run() {
+             commands::maa_core::maa_create_instance,
+             commands::maa_core::maa_destroy_instance,
+             commands::maa_core::maa_connect_controller,
++            commands::maa_core::maa_cloud_web_login,
+             commands::maa_core::maa_get_connection_status,
+             commands::maa_core::maa_load_resource,
+             commands::maa_core::maa_is_resource_loaded,
+@@ -331,6 +332,7 @@ pub fn run() {
                  tauri::WindowEvent::Destroyed => {
                      if let Some(state) = window.try_state::<Arc<MaaState>>() {
                          state.cleanup_all_agent_children();
@@ -964,7 +1382,7 @@ index 444a547..cb85f4e 100644
                      }
                  }
                  _ => {}
-@@ -338,9 +339,12 @@ pub fn run() {
+@@ -338,9 +340,12 @@ pub fn run() {
          })
          .build(tauri::generate_context!())
          .expect("error while building tauri application")
@@ -979,10 +1397,10 @@ index 444a547..cb85f4e 100644
              }
          });
 diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
-index c3df40e..6fd6816 100644
+index c3df40e..4999465 100644
 --- a/src-tauri/src/main.rs
 +++ b/src-tauri/src/main.rs
-@@ -5,6 +5,16 @@
+@@ -5,6 +5,18 @@
  mod webview2;
  
  fn main() {
@@ -990,7 +1408,9 @@ index c3df40e..6fd6816 100644
 +    // services and telemetry. It still uses the real native Maa Tasker.
 +    let args: Vec<String> = std::env::args().collect();
 +    if args.iter().any(|arg| arg == "--cloudweb-self-test") {
-+        let report = args.windows(2).find(|pair| pair[0] == "--report")
++        let report = args
++            .windows(2)
++            .find(|pair| pair[0] == "--report")
 +            .map(|pair| std::path::PathBuf::from(&pair[1]))
 +            .unwrap_or_else(|| std::path::PathBuf::from("cloudweb-integration-report.json"));
 +        let result = mxu_lib::commands::cloud_web::run_fixture_smoke(&report);
@@ -999,7 +1419,7 @@ index c3df40e..6fd6816 100644
      let _cli = mxu_lib::commands::system::init_cli();
  
      #[cfg(target_os = "windows")]
-@@ -40,35 +50,9 @@ fn main() {
+@@ -40,35 +52,9 @@ fn main() {
              std::process::exit(1);
          }
  
@@ -1039,10 +1459,10 @@ index c3df40e..6fd6816 100644
  
      mxu_lib::run()
 diff --git a/src-tauri/src/mxu_actions.rs b/src-tauri/src/mxu_actions.rs
-index 384bdf5..653307e 100644
+index 384bdf5..8f76f98 100644
 --- a/src-tauri/src/mxu_actions.rs
 +++ b/src-tauri/src/mxu_actions.rs
-@@ -41,6 +41,22 @@ fn request_tasker_stop(ctx: &maa_framework::context::Context) -> bool {
+@@ -41,6 +41,34 @@ fn request_tasker_stop(ctx: &maa_framework::context::Context) -> bool {
      unsafe { maa_framework::sys::MaaTaskerPostStop(tasker_ptr) != 0 }
  }
  
@@ -1050,22 +1470,34 @@ index 384bdf5..653307e 100644
 +/// from an older saved desktop task must not escape that boundary.
 +fn is_cloud_web_context(ctx: &maa_framework::context::Context) -> bool {
 +    let tasker = ctx.tasker_handle();
-+    if tasker.is_null() { return false; }
++    if tasker.is_null() {
++        return false;
++    }
 +    let controller = unsafe { maa_framework::sys::MaaTaskerGetController(tasker) };
-+    if controller.is_null() { return false; }
-+    let Ok(buffer) = maa_framework::buffer::MaaStringBuffer::new() else { return false; };
++    if controller.is_null() {
++        return false;
++    }
++    let Ok(buffer) = maa_framework::buffer::MaaStringBuffer::new() else {
++        return false;
++    };
 +    if unsafe { maa_framework::sys::MaaControllerGetInfo(controller, buffer.as_ptr()) } == 0 {
 +        return false;
 +    }
-+    serde_json::from_str::<serde_json::Value>(&buffer.to_string()).ok()
-+        .and_then(|value| value.get("type").and_then(|v| v.as_str()).map(str::to_owned))
++    serde_json::from_str::<serde_json::Value>(&buffer.to_string())
++        .ok()
++        .and_then(|value| {
++            value
++                .get("type")
++                .and_then(|v| v.as_str())
++                .map(str::to_owned)
++        })
 +        .is_some_and(|kind| kind.eq_ignore_ascii_case("cloudweb"))
 +}
 +
  fn wait_with_stop_check(ctx: &maa_framework::context::Context, total_secs: u64) -> bool {
      const STEP: std::time::Duration = std::time::Duration::from_millis(200);
      let total = std::time::Duration::from_secs(total_secs);
-@@ -198,9 +214,13 @@ const MXU_LAUNCH_ACTION: &str = "MXU_LAUNCH_ACTION";
+@@ -198,9 +226,13 @@ const MXU_LAUNCH_ACTION: &str = "MXU_LAUNCH_ACTION";
  /// MXU_LAUNCH custom action 回调函数
  /// 从 custom_action_param 中读取 program, args, wait_for_exit，启动外部程序
  fn mxu_launch_action_fn(
@@ -1080,7 +1512,7 @@ index 384bdf5..653307e 100644
      let param_str = args.param;
      info!("[MXU_LAUNCH] Received param: {}", param_str);
  
-@@ -498,6 +518,11 @@ fn mxu_killproc_action_impl(
+@@ -498,6 +530,11 @@ fn mxu_killproc_action_impl(
          };
      }
  
@@ -1093,7 +1525,7 @@ index 384bdf5..653307e 100644
          Some(p) if !p.trim().is_empty() => p.to_string(),
          _ => {
 diff --git a/src/components/ConnectionPanel.tsx b/src/components/ConnectionPanel.tsx
-index 9744492..f3146c2 100644
+index 9744492..3eee9a1 100644
 --- a/src/components/ConnectionPanel.tsx
 +++ b/src/components/ConnectionPanel.tsx
 @@ -6,6 +6,7 @@ import {
@@ -1146,9 +1578,26 @@ index 9744492..f3146c2 100644
        // PlayCover 不需要搜索，直接连接
        autoReconnectAttempted.add(instanceId);
        handleConnect();
-@@ -634,7 +646,12 @@ export function ConnectionPanel() {
+@@ -633,8 +645,29 @@ export function ConnectionPanel() {
+   };
  
    // 连接设备
++  const handleCloudWebLogin = async () => {
++    if (isConnecting || isConnected || isRunning || !cloudWebUrl.trim()) return;
++    setIsConnecting(true);
++    setDeviceError(null);
++    autoReconnectAttempted.add(instanceId);
++    try {
++      if (!(await ensureMaaInitialized())) return;
++      await maaService.createInstance(instanceId);
++      await maaService.openCloudWebLogin(instanceId, cloudWebUrl.trim());
++    } catch (err) {
++      setDeviceError(err instanceof Error ? err.message : t('controller.connectionFailed'));
++    } finally {
++      setIsConnecting(false);
++    }
++  };
++
    const handleConnect = async () => {
 -    if (!currentController) return;
 +    if (!currentController || !instanceId || isConnecting || isRunning) return;
@@ -1160,7 +1609,7 @@ index 9744492..f3146c2 100644
  
      setIsConnecting(true);
      setDeviceError(null);
-@@ -682,6 +699,13 @@ export function ConnectionPanel() {
+@@ -682,6 +715,13 @@ export function ConnectionPanel() {
          };
          deviceName = selectedWlrootsSocket;
          targetType = 'device';
@@ -1174,7 +1623,7 @@ index 9744492..f3146c2 100644
        } else if (controllerType === 'PlayCover') {
          // 保存 PlayCover 地址到实例配置
          setInstanceSavedDevice(instanceId, { playcoverAddress });
-@@ -826,6 +850,8 @@ export function ConnectionPanel() {
+@@ -826,6 +866,8 @@ export function ConnectionPanel() {
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1183,7 +1632,7 @@ index 9744492..f3146c2 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -1395,6 +1421,7 @@ export function ConnectionPanel() {
+@@ -1395,6 +1437,7 @@ export function ConnectionPanel() {
        return isLinuxReadyWith(selectedGamescopeInstance, selectedWlrootsSocket);
      }
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
@@ -1191,7 +1640,7 @@ index 9744492..f3146c2 100644
      return false;
    };
  
-@@ -1421,6 +1448,9 @@ export function ConnectionPanel() {
+@@ -1421,6 +1464,9 @@ export function ConnectionPanel() {
      // 获取设备显示文本（优先显示具体设备名）
      const getDeviceStatusText = () => {
        const savedDevice = activeInstance?.savedDevice;
@@ -1201,7 +1650,7 @@ index 9744492..f3146c2 100644
        if (savedDevice?.adbDeviceName) {
          return truncateText(savedDevice.adbDeviceName, 6);
        }
-@@ -1469,7 +1499,8 @@ export function ConnectionPanel() {
+@@ -1469,7 +1515,8 @@ export function ConnectionPanel() {
            ((s.gamescopeDisplayNo !== undefined &&
              (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
              (s.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
@@ -1211,7 +1660,7 @@ index 9744492..f3146c2 100644
        );
      };
  
-@@ -1668,6 +1699,71 @@ export function ConnectionPanel() {
+@@ -1668,6 +1715,89 @@ export function ConnectionPanel() {
                </div>
              )}
  
@@ -1230,53 +1679,71 @@ index 9744492..f3146c2 100644
 +                  }}
 +                  disabled={isConnected || isConnecting || isRunning}
 +                />
-+                <button
-+                  onClick={
-+                    isConnected
-+                      ? async () => {
-+                          if (isRunning || isConnecting) return;
-+                          setIsConnecting(true);
-+                          try {
-+                            await maaService.destroyInstance(instanceId);
-+                            setIsConnected(false);
-+                            setInstanceConnectionStatus(instanceId, 'Disconnected');
-+                            setInstanceResourceLoaded(instanceId, false);
-+                            autoReconnectAttempted.add(instanceId);
-+                          } catch (err) {
-+                            setDeviceError(
-+                              err instanceof Error ? err.message : t('controller.connectionFailed'),
-+                            );
-+                          } finally {
-+                            setIsConnecting(false);
++                <div className="flex gap-2">
++                  <button
++                    onClick={handleCloudWebLogin}
++                    disabled={
++                      isConnecting ||
++                      isConnected ||
++                      isRunning ||
++                      !cloudWebUrl.trim() ||
++                      !canConnect()
++                    }
++                    className="flex-1 px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50"
++                  >
++                    {t('controller.cloudWebLogin')}
++                  </button>
++                  <button
++                    onClick={
++                      isConnected
++                        ? async () => {
++                            if (isRunning || isConnecting) return;
++                            setIsConnecting(true);
++                            try {
++                              await maaService.destroyInstance(instanceId);
++                              setIsConnected(false);
++                              setInstanceConnectionStatus(instanceId, 'Disconnected');
++                              setInstanceResourceLoaded(instanceId, false);
++                              autoReconnectAttempted.add(instanceId);
++                            } catch (err) {
++                              setDeviceError(
++                                err instanceof Error
++                                  ? err.message
++                                  : t('controller.connectionFailed'),
++                              );
++                            } finally {
++                              setIsConnecting(false);
++                            }
 +                          }
-+                        }
-+                      : handleConnect
-+                  }
-+                  disabled={isConnecting || isRunning || (!isConnected && !canConnect())}
-+                  className={clsx(
-+                    'w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded-md border text-sm transition-colors',
-+                    isConnecting || isRunning || (!isConnected && !canConnect())
-+                      ? 'bg-bg-tertiary border-border opacity-50 cursor-not-allowed'
-+                      : isConnected
-+                        ? 'bg-bg-tertiary border-border text-text-secondary hover:bg-bg-hover'
-+                        : 'bg-accent border-accent text-white hover:bg-accent-hover',
-+                  )}
-+                >
-+                  {isConnecting ? (
-+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-+                  ) : isConnected ? (
-+                    <WifiOff className="w-3.5 h-3.5" />
-+                  ) : (
-+                    <Wifi className="w-3.5 h-3.5" />
-+                  )}
-+                  {t(
-+                    isConnecting
-+                      ? 'controller.connecting'
-+                      : isConnected
-+                        ? 'controller.disconnect'
-+                        : 'controller.connect',
-+                  )}
-+                </button>
++                        : handleConnect
++                    }
++                    disabled={isConnecting || isRunning || (!isConnected && !canConnect())}
++                    className={clsx(
++                      'flex-1 flex items-center justify-center gap-2 px-3 py-1.5 rounded-md border text-sm transition-colors',
++                      isConnecting || isRunning || (!isConnected && !canConnect())
++                        ? 'bg-bg-tertiary border-border opacity-50 cursor-not-allowed'
++                        : isConnected
++                          ? 'bg-bg-tertiary border-border text-text-secondary hover:bg-bg-hover'
++                          : 'bg-accent border-accent text-white hover:bg-accent-hover',
++                    )}
++                  >
++                    {isConnecting ? (
++                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
++                    ) : isConnected ? (
++                      <WifiOff className="w-3.5 h-3.5" />
++                    ) : (
++                      <Wifi className="w-3.5 h-3.5" />
++                    )}
++                    {t(
++                      isConnecting
++                        ? 'controller.connecting'
++                        : isConnected
++                          ? 'controller.disconnect'
++                          : 'controller.connect',
++                    )}
++                  </button>
++                </div>
++                <p className="text-xs text-text-muted">{t('controller.cloudWebPreviewNote')}</p>
 +              </div>
 +            )}
 +
@@ -1444,10 +1911,10 @@ index 644006d..66317ae 100644
              onPhaseChange?.('searching');
 diff --git a/src/components/connection/CloudWebUrlInput.tsx b/src/components/connection/CloudWebUrlInput.tsx
 new file mode 100644
-index 0000000..ce0ad80
+index 0000000..7edddde
 --- /dev/null
 +++ b/src/components/connection/CloudWebUrlInput.tsx
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,48 @@
 +import { useId } from 'react';
 +import { useTranslation } from 'react-i18next';
 +import clsx from 'clsx';
@@ -1465,7 +1932,10 @@ index 0000000..ce0ad80
 +  const id = useId();
 +  const invalid = !isValidCloudWebUrl(value);
 +  return (
-+    <div className="flex-1 min-w-0 space-y-1.5">
++    <details className="flex-1 min-w-0 space-y-1.5">
++      <summary className="text-xs text-text-secondary cursor-pointer">
++        {t('controller.cloudWebAdvanced')}
++      </summary>
 +      <label htmlFor={id} className="block text-xs text-text-secondary">
 +        {t('controller.cloudWebUrl')}
 +      </label>
@@ -1490,7 +1960,7 @@ index 0000000..ce0ad80
 +      <p id={`${id}-hint`} className={clsx('text-xs', invalid ? 'text-error' : 'text-text-muted')}>
 +        {t(invalid ? 'controller.cloudWebInvalidUrl' : 'controller.cloudWebHint')}
 +      </p>
-+    </div>
++    </details>
 +  );
 +}
 diff --git a/src/components/connection/useDeviceConnection.ts b/src/components/connection/useDeviceConnection.ts
@@ -1622,10 +2092,10 @@ index bcc696b..1554dcd 100644
      canConnect,
      ensureMaaInitialized,
 diff --git a/src/i18n/locales/en-US.ts b/src/i18n/locales/en-US.ts
-index 154e625..ff0ed32 100644
+index 154e625..ad51790 100644
 --- a/src/i18n/locales/en-US.ts
 +++ b/src/i18n/locales/en-US.ts
-@@ -402,6 +402,25 @@ export default {
+@@ -402,6 +402,29 @@ export default {
  
    // Controller
    controller: {
@@ -1642,6 +2112,10 @@ index 154e625..ff0ed32 100644
 +      'Close the app and restart without administrator privileges before connecting',
 +    cloudWeb: 'Cloud · Endfield Web',
 +    cloudWebUrl: 'Cloud game URL',
++    cloudWebLogin: 'Log in',
++    cloudWebAdvanced: 'Advanced (preview debug URL)',
++    cloudWebPreviewNote:
++      'Login is saved locally. The official entry is not available yet; Connect binds the browser only. Automatic tasks after queuing are not enabled.',
 +    cloudWebUrlPlaceholder: 'HTTPS URL (empty for local test page)',
 +    cloudWebHint:
 +      'Enter the cloud game HTTPS entry point. Leave empty for the bundled offline test page; it does not log in or enter the real game. Each instance has its own browser session.',
@@ -1708,10 +2182,10 @@ index c3bee79..8f75460 100644
      selectController: '컨트롤러 선택',
      adb: 'Android 기기',
 diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
-index 3dca5fc..9539182 100644
+index 3dca5fc..d7cd5cd 100644
 --- a/src/i18n/locales/zh-CN.ts
 +++ b/src/i18n/locales/zh-CN.ts
-@@ -390,6 +390,20 @@ export default {
+@@ -390,6 +390,24 @@ export default {
  
    // 控制器
    controller: {
@@ -1724,6 +2198,10 @@ index 3dca5fc..9539182 100644
 +    cloudWebElevated: '请关闭程序，并以普通用户权限重新启动后连接云游戏',
 +    cloudWeb: '云·终末地网页版',
 +    cloudWebUrl: '云游戏网页地址',
++    cloudWebLogin: '登录',
++    cloudWebAdvanced: '高级设置（预开发调试网址）',
++    cloudWebPreviewNote:
++      '登录状态保存在本机。官方入口尚未上线；连接只绑定浏览器，排队后自动运行任务暂未启用。',
 +    cloudWebUrlPlaceholder: 'HTTPS 地址（留空使用本地验证页）',
 +    cloudWebHint:
 +      '填写云游戏的 HTTPS 入口。留空使用随包本地验证页，不会登录或进入真实游戏。每个配置使用独立浏览器会话。',
@@ -1856,7 +2334,7 @@ index aa3744c..eefdfe3 100644
      // 过滤掉当前平台不支持的控制器（纯前端 dev 预览无后端，回退到浏览器平台）
      filterControllersByPlatform(pi, '');
 diff --git a/src/services/maaService.ts b/src/services/maaService.ts
-index 62be25e..ffc750d 100644
+index 62be25e..f5fe02c 100644
 --- a/src/services/maaService.ts
 +++ b/src/services/maaService.ts
 @@ -19,12 +19,15 @@ import { loggers } from '@/utils/logger';
@@ -1875,7 +2353,22 @@ index 62be25e..ffc750d 100644
    const message = error instanceof Error ? error.message : String(error);
    if (message.includes('MACOS_PERMISSIONS_REQUIRED')) {
      return new Error(i18n.t('controller.macosPermissionsRequired'));
-@@ -298,14 +301,18 @@ export const maaService = {
+@@ -108,6 +111,14 @@ export interface SelfStopRequestedEvent {
+ 
+ /** MaaFramework 服务 */
+ export const maaService = {
++  async openCloudWebLogin(instanceId: string, url: string): Promise<void> {
++    try {
++      await invoke('maa_cloud_web_login', { instanceId, url });
++    } catch (error) {
++      throw localizeControllerError(error);
++    }
++  },
++
+   /**
+    * 初始化 MaaFramework
+    * @param libDir MaaFramework 库目录（可选，默认从 exe 目录/maafw 加载）
+@@ -298,14 +309,18 @@ export const maaService = {
     * @param instanceId 实例 ID
     */
    async destroyInstance(instanceId: string): Promise<void> {
@@ -1901,7 +2394,7 @@ index 62be25e..ffc750d 100644
    },
  
    /**
-@@ -316,7 +323,11 @@ export const maaService = {
+@@ -316,7 +331,11 @@ export const maaService = {
     */
    async connectController(instanceId: string, config: ControllerConfig): Promise<number> {
      log.info('连接控制器, 实例:', instanceId, '类型:', config.type);
@@ -1914,7 +2407,7 @@ index 62be25e..ffc750d 100644
  
      try {
        if (!isTauri()) {
-@@ -433,31 +444,35 @@ export const maaService = {
+@@ -433,31 +452,35 @@ export const maaService = {
      pipelineOverride: string = '{}',
      selectedTaskId?: string,
    ): Promise<number> {
@@ -1972,7 +2465,7 @@ index 62be25e..ffc750d 100644
    },
  
    /**
-@@ -478,14 +493,18 @@ export const maaService = {
+@@ -478,14 +501,18 @@ export const maaService = {
     * @param instanceId 实例 ID
     */
    async stopTask(instanceId: string): Promise<void> {
@@ -1998,7 +2491,7 @@ index 62be25e..ffc750d 100644
    },
  
    /**
-@@ -646,51 +665,55 @@ export const maaService = {
+@@ -646,51 +673,55 @@ export const maaService = {
      controllerInfo?: ControllerTelemetryInfo,
      logRedactSecrets?: string[],
    ): Promise<number[]> {

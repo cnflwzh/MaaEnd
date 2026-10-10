@@ -47,3 +47,24 @@ MXU 基线固定为 `MistEO/MXU@9fa8cc51e8ff8cd89d99f3ea55fe3a7a82e6ede3`，`mxu
 本地执行上述工作流中的命令体，分别生成 `build-cloudweb-inputs/mxu`、`build-cloudweb-inputs/maaend-runtime` 和 `build-cloudweb-inputs/qt-host`。按用户当前要求，仅构建并执行 `build_full_package.py assemble`、`build_full_package.py archive-unverified`，不运行验收，最终由用户自行测试。包内 `runtime-acceptance.json` 明确记录未验收状态。
 
 界面验证使用临时的 `config/mxu-MaaEnd.json`。打包时恢复干净配置，不保留验证实例或浏览器缓存。主程序目录为 `build-cloudweb-full/MaaEnd-CloudWeb`，便携 ZIP 和校验值位于 `build-cloudweb-full/deliverables`。
+
+
+## Persistent login preview
+
+The original connection panel now opens a login browser without connecting the tasker.
+Connect reuses that instance-owned browser. Per-instance, per-origin profiles persist
+cookies (including session cookies), local storage and cache under
+`config/cloudweb-profiles`. A process lock prevents simultaneous profile writers.
+Normal shutdown asks the child to exit and explicitly destroys its Qt profile;
+unresponsive protocol sessions still terminate to prevent late input.
+
+The official endpoint is not published yet. A collapsed advanced URL field remains
+for development. Queue recognition and automatic task start require real provider
+page states; this preview must not treat document load as game readiness. The native
+GUI CLI still requires a graphical desktop; true headless execution is unsupported.
+The host records bounded video/capability diagnostics without login values in the
+profile directory. Autoplay and user-initiated foreground mouse lock are enabled;
+raw relative automation and real cloud-game compatibility remain unverified.
+
+Build into a fresh output using `build_full_package.py assemble --output <new-path>`.
+Never assemble over a directory used by the user, or archive its login profiles.
