@@ -1,0 +1,84 @@
+name: CloudWeb Windows portable prototype
+
+on:
+  push:
+    branches:
+      - "experiment/cloud-web-controller-20261010"
+    paths:
+      - ".github/workflows/cloudweb-prototype.yml"
+      - "tools/CloudWebController/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudweb-prototype-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-portable:
+    # This experiment never publishes an upstream release or runs on another ref.
+    if: github.ref == 'refs/heads/experiment/cloud-web-controller-20261010'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      PYTHONUTF8: "1"
+      PYTHONUNBUFFERED: "1"
+      QT_OPENGL: software
+      QT_QUICK_BACKEND: software
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install only the isolated prototype dependencies
+        run: |
+          New-Item -ItemType Directory -Force build-cloudweb-windows/logs | Out-Null
+          python -m pip install -r tools/CloudWebController/packaging/requirements-build.txt 2>&1 | Tee-Object build-cloudweb-windows/logs/dependencies.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip freeze | Tee-Object build-cloudweb-windows/logs/pip-freeze.txt
+
+      - name: Test policy, lifecycle and source launcher
+        run: python tools/CloudWebController/packaging/build_windows.py test-source
+
+      - name: Build one-folder executable with runtime and notices
+        run: python tools/CloudWebController/packaging/build_windows.py build
+
+      - name: Test frozen launcher, Maa input and local video
+        run: python tools/CloudWebController/packaging/build_windows.py test-frozen
+
+      - name: Create verified portable ZIP and SHA256
+        run: python tools/CloudWebController/packaging/build_windows.py archive
+
+      - name: Upload portable package and run instructions
+        uses: actions/upload-artifact@v6
+        with:
+          name: CloudWeb-Prototype-Windows-x64-${{ github.sha }}
+          path: build-cloudweb-windows/deliverables/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload test evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: CloudWeb-Windows-validation-${{ github.sha }}
+          path: |
+            build-cloudweb-windows/logs/
+            build-cloudweb-windows/source-smoke/
+            build-cloudweb-windows/frozen-smoke/
+            build-cloudweb-windows/frozen-webrtc/
+            build-cloudweb-windows/pyinstaller/cloudweb/warn-cloudweb.txt
+            tools/CloudWebController/packaging/WINDOWS-README.txt
+          if-no-files-found: warn
+          retention-days: 14

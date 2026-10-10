@@ -1,0 +1,5 @@
+-r ../requirements-qt.txt
+# Official release: https://pypi.org/project/pyinstaller/6.22.3/
+PyInstaller==6.22.3
+MaaAgentBinary==1.0.1
+StrEnum==0.4.15

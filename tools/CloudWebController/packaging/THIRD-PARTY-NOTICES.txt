@@ -1,0 +1,55 @@
+Third-party components in the Windows portable prototype
+
+This application is part of MaaEnd, licensed under AGPL-3.0 (see LICENSE).
+The matching experiment source and packaging instructions are in source/.
+The full repository and the build commit are recorded in build-info.json.
+
+Qt for Python / PySide6 / Shiboken and Qt
+Copyright The Qt Company Ltd. and other contributors.
+The open-source distribution is used under LGPL-3.0, together with the applicable
+third-party licenses. The LGPL-3.0 and GPL-3.0 texts are included in licenses/.
+Qt WebEngine contains Chromium and third-party libraries. The official license
+documentation matching the engine version is saved as offline text in
+licenses/QtWebEngine-ThirdPartyNotices.txt, with each original source URL.
+The LGPL-2.1 text is also included for relevant Chromium/FFmpeg components.
+Sources and notices:
+https://code.qt.io/cgit/pyside/pyside-setup.git/
+https://code.qt.io/cgit/qt/qtbase.git/
+https://code.qt.io/cgit/qt/qtwebengine.git/
+https://doc.qt.io/qtforpython-6/licenses.html
+https://doc.qt.io/qt-6/qtwebengine-licensing.html
+
+MaaFramework and its native runtime
+Copyright MaaXYZ and contributors, LGPL-3.0.
+https://github.com/MaaXYZ/MaaFramework
+https://github.com/MaaXYZ/MaaDeps
+Native third-party components retain their upstream licenses. This bundle copies
+the license/notice materials present in the installed distributions. Maa uses
+OpenCV and ONNX Runtime; their Apache-2.0 and MIT notices are included separately.
+
+Python, NumPy, Pillow, StrEnum and other Python dependencies
+The exact installed versions and distribution metadata are in build-info.json
+and licenses/. License/copyright/notice files included in their wheels are copied
+without modification. The CPython distribution's LICENSE.txt is included.
+
+PyInstaller
+Copyright the PyInstaller development team.
+GPL-2.0-or-later with an exception for distributing bundled applications; its
+license and exception are copied from the installed PyInstaller distribution.
+https://pyinstaller.org/en/stable/license.html
+
+Replacing or rebuilding libraries
+This is a one-folder build. Qt and Maa remain dynamically linked in _internal/.
+Compatible replacement libraries can be substituted, or the application can be
+rebuilt with modified dependencies using the included source and pinned build
+requirements. No additional restriction is imposed on reverse engineering for
+debugging modifications permitted by the component licenses.
+
+The LGPL-3.0 and GPL-3.0 texts were obtained verbatim from the Qt project's v6.8.0
+LICENSES directory; LGPL-2.1 comes from the SPDX license list v3.27.0. These
+standard license versions are independent of the Qt runtime version.
+See build-info.json for the actual runtime versions.
+https://github.com/qt/qtbase/tree/v6.8.0/LICENSES
+https://github.com/spdx/license-list-data/blob/v3.27.0/text/LGPL-2.1-only.txt
+OpenCV license text: https://github.com/opencv/opencv/blob/4.12.0/LICENSE
+ONNX Runtime notices: https://github.com/microsoft/onnxruntime/blob/v1.19.2/ThirdPartyNotices.txt

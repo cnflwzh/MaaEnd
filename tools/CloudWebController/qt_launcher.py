@@ -1,17 +1,20 @@
 """Native connection selector for the independent experiment, not MXU."""
 
+import argparse
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QProcess
+from PySide6.QtCore import QProcess, QTimer
 from PySide6.QtWidgets import QApplication, QComboBox, QFormLayout, QLabel, QLineEdit, QPushButton, QWidget
 
 from qt_policy import https_origin
 
 
 class Launcher(QWidget):
-    def __init__(self):
+    def __init__(self, *, smoke=False, output=Path("cloudweb-results")):
         super().__init__()
+        self.smoke = smoke
+        self.output = output.resolve()
         self.setWindowTitle("MaaEnd · 云网页控制器实验")
         self.setMinimumWidth(580)
         layout = QFormLayout(self)
@@ -41,7 +44,13 @@ class Launcher(QWidget):
 
     def launch(self):
         mode = self.connection.currentData()
-        args = [str(Path(__file__).with_name("qt_main.py")), "--connection", mode, "--keep-open"]
+        # A frozen executable cannot ask sys.executable to interpret qt_main.py.
+        # Use the same entry point in both source and portable builds so the
+        # launcher-to-worker path is covered by the Windows smoke check.
+        args = [] if getattr(sys, "frozen", False) else [str(Path(__file__).resolve())]
+        args += ["--worker", "--connection", mode, "--output", str(self.output)]
+        if not self.smoke:
+            args.append("--keep-open")
         if mode == "embedded-webview":
             try:
                 https_origin(self.url.text())
@@ -55,7 +64,9 @@ class Launcher(QWidget):
 
     def finished(self, code, *_):
         self.start.setEnabled(True)
-        self.status.setText("实验窗口已结束" if code == 0 else "启动或验证失败，请查看控制台与 cloudweb-results/report.json")
+        self.status.setText("实验窗口已结束" if code == 0 else f"启动或验证失败，请查看控制台与 {self.output / 'report.json'}")
+        if self.smoke:
+            QApplication.instance().exit(0 if code == 0 else 1)
 
     def closeEvent(self, event):
         if self.process.state() != QProcess.ProcessState.NotRunning:
@@ -67,9 +78,19 @@ class Launcher(QWidget):
 
 
 def main():
-    app = QApplication(sys.argv)
-    window = Launcher()
+    if len(sys.argv) > 1 and sys.argv[1] == "--worker":
+        del sys.argv[1]
+        from qt_main import main as worker_main
+        return worker_main()
+    parser = argparse.ArgumentParser(description="Experimental CloudWeb connection selector")
+    parser.add_argument("--launcher-smoke", action="store_true", help="Check launcher/worker with the offline fixture, then exit")
+    parser.add_argument("--output", type=Path, default=Path("cloudweb-results"))
+    args = parser.parse_args()
+    app = QApplication([sys.argv[0]])
+    window = Launcher(smoke=args.launcher_smoke, output=args.output)
     window.show()
+    if args.launcher_smoke:
+        QTimer.singleShot(0, window.launch)
     return app.exec()
 
 

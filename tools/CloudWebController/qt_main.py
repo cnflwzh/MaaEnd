@@ -103,7 +103,7 @@ def smoke(host, controller, directory, report):
             check("covered_click", job_ok(controller.post_click(250, 360)))
             check("covered_click_delivered", observed(host, lambda: host.title() == "MaaEnd bridge: clicked 2"))
         finally:
-            host.call_on_ui(cover.close)
+            host.call_on_ui(lambda: (cover.close(), cover.deleteLater()))
         report["desktop_occlusion"] = "tested with separate native cover window"
     else:
         report["desktop_occlusion"] = "not tested: offscreen/minimal is not a desktop window system"
