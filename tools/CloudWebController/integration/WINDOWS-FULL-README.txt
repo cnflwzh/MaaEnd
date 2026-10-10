@@ -25,5 +25,5 @@ validation 包含实际执行的验证报告和完整主界面截图。
 分享 debug 或截图前请检查私人网页、账号和其他个人信息。
 LICENSE、licenses 和 cloudweb-host/licenses 包含开源许可材料。
 源码见记录的仓库与提交，MXU 改动补丁附在 source/CloudWebIntegration。
-mxu-formatted.patch 是 CI 使用预装 rustfmt 格式化后实际参与构建的完整补丁；
+mxu-formatted.patch 是使用 rustfmt 格式化后实际参与本地构建的完整补丁；
 对应工具版本保存在验证日志中，可从记录的 MXU 基线提交复现源码。

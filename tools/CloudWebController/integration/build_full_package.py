@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
@@ -88,21 +89,27 @@ def assemble():
     runtime = INPUTS / "maaend-runtime"
     application = INPUTS / "mxu"
     host = INPUTS / "qt-host"
+    packaging_commit = git("rev-parse", "HEAD")
+    component_commit = os.environ.get("CLOUDWEB_COMPONENT_COMMIT", packaging_commit)
+    component_root = ROOT / "component-source" if component_commit != packaging_commit else ROOT
+    if git("rev-parse", "HEAD", cwd=component_root) != component_commit:
+        raise RuntimeError("Component source checkout does not match the immutable build commit")
     shutil.copytree(runtime, APP, dirs_exist_ok=True)
-    shutil.copy2(ROOT / "assets" / "mxu-cloudweb.json", APP / "mxu-cloudweb.json")
+    shutil.copy2(component_root / "assets" / "mxu-cloudweb.json", APP / "mxu-cloudweb.json")
     shutil.copy2(application / "mxu.exe", APP / "MaaEnd.exe")
     shutil.copytree(host, APP / "cloudweb-host", dirs_exist_ok=True)
     # The full app is the only documented entry point. The Qt selector is internal.
     for name in ("Start-CloudWeb.cmd", "WINDOWS-README.txt"):
         (APP / "cloudweb-host" / name).unlink(missing_ok=True)
     shutil.copy2(ROOT / "tools" / "CloudWebController" / "integration" / "WINDOWS-FULL-README.txt", APP / "WINDOWS-FULL-README.txt")
-    shutil.copy2(ROOT / "LICENSE", APP / "LICENSE")
+    shutil.copy2(component_root / "LICENSE", APP / "LICENSE")
     licenses = APP / "licenses"
     licenses.mkdir(parents=True, exist_ok=True)
     shutil.copy2(application / "MXU-LICENSE", licenses / "MXU-LICENSE")
     source = APP / "source" / "CloudWebIntegration"
     source.mkdir(parents=True, exist_ok=True)
-    for name in ("mxu.patch", "build_full_package.py", "WINDOWS-FULL-README.txt"):
+    shutil.copy2(component_root / "tools" / "CloudWebController" / "integration" / "mxu.patch", source / "mxu.patch")
+    for name in ("build_full_package.py", "capture_window.ps1", "WINDOWS-FULL-README.txt"):
         shutil.copy2(ROOT / "tools" / "CloudWebController" / "integration" / name, source / name)
     formatted_patch = application / "build-evidence" / "mxu-formatted.patch"
     if not formatted_patch.is_file():
@@ -134,14 +141,23 @@ def assemble():
             "connectionPanelExpanded": True,
         },
     }
-    (APP / "mxu-MaaEnd.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    config_dir = APP / "config"
+    if config_dir.exists():
+        shutil.rmtree(config_dir)
+    config_dir.mkdir()
+    (APP / "mxu-MaaEnd.json").unlink(missing_ok=True)
+    (config_dir / "mxu-MaaEnd.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     info = {
         "experimental": True,
         "product": "Full MaaEnd GUI with experimental CloudWeb connection",
         "entrypoint": "MaaEnd.exe",
         "package_type": "portable ZIP, not an installer",
         "maaend_repository": "https://github.com/cnflwzh/MaaEnd",
-        "maaend_commit": git("rev-parse", "HEAD"),
+        "maaend_commit": component_commit,
+        "component_source_commit": component_commit,
+        "packaging_commit": packaging_commit,
+        "component_build_run_id": os.environ.get("CLOUDWEB_COMPONENT_RUN_ID"),
+        "component_artifact_ids": json.loads(os.environ.get("CLOUDWEB_COMPONENT_ARTIFACT_IDS", "{}")),
         "mxu_repository": "https://github.com/MistEO/MXU",
         "mxu_base_commit": MXU_COMMIT,
         "mxu_patch_sha256": digest(source / "mxu.patch"),
@@ -150,7 +166,7 @@ def assemble():
         "maafw_archive_sha256": FRAMEWORK_SHA256,
         "maadeps_version": "v2.12.6",
         "platform": platform.platform(),
-        "built_at_utc": datetime.now(timezone.utc).isoformat(),
+        "packaged_at_utc": datetime.now(timezone.utc).isoformat(),
         "files_sha256": {name: digest(APP / name) for name in required},
         "game_compatibility": "unverified; local fixture success does not establish live cloud-game compatibility",
     }
@@ -188,7 +204,7 @@ def seed_ui_check():
     """Prepare a disposable CI config; restore it before producing the ZIP."""
     import json5
 
-    config_path = APP / "mxu-MaaEnd.json"
+    config_path = APP / "config" / "mxu-MaaEnd.json"
     shutil.copy2(config_path, OUT / "clean-config.json")
     interface_path = APP / "interface.json"
     shutil.copy2(interface_path, OUT / "shipping-interface.json")
@@ -236,7 +252,12 @@ def archive():
             raise RuntimeError("Full MaaEnd window capture is blank or incomplete")
     # Never ship a verification run's selected tasks, browser cache or logs as
     # the user's starting configuration. Keep only the explicit evidence folder.
-    shutil.copy2(OUT / "clean-config.json", APP / "mxu-MaaEnd.json")
+    # Remove run-generated backups/layout caches too, then restore only the
+    # explicit shipping config under MXU's actual config directory.
+    shutil.rmtree(APP / "config")
+    (APP / "config").mkdir()
+    shutil.copy2(OUT / "clean-config.json", APP / "config" / "mxu-MaaEnd.json")
+    (APP / "mxu-MaaEnd.json").unlink(missing_ok=True)
     shutil.copy2(OUT / "shipping-interface.json", APP / "interface.json")
     for directory in ("cache", "debug"):
         if (APP / directory).exists():
@@ -244,8 +265,8 @@ def archive():
     shutil.copytree(evidence, APP / "validation" / "full-app", dirs_exist_ok=True)
     deliverables = OUT / "deliverables"
     deliverables.mkdir(parents=True, exist_ok=True)
-    commit = git("rev-parse", "HEAD")[:12]
-    filename = f"MaaEnd-CloudWeb-full-windows-x64-{commit}"
+    info = json.loads((APP / "cloudweb-build-info.json").read_text(encoding="utf-8"))
+    filename = f"MaaEnd-CloudWeb-full-windows-x64-{info['component_source_commit'][:12]}-pkg-{info['packaging_commit'][:12]}"
     archive_path = Path(shutil.make_archive(str(deliverables / filename), "zip", APP.parent, APP.name))
     checksum = digest(archive_path)
     (deliverables / f"{filename}.zip.sha256").write_text(f"{checksum}  {archive_path.name}\n", encoding="ascii")

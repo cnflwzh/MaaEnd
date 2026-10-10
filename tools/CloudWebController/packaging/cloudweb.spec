@@ -1,7 +1,17 @@
 # Build on Windows x64 with the pinned packaging requirements.
 from pathlib import Path
+import os
+import sys
 
 from PyInstaller.utils.hooks import collect_all
+
+# Resolve native dependencies from this Python environment and Windows only.
+# An unrelated tool on PATH can provide an incompatible same-named ICU DLL;
+# collecting it shadows Windows ICU and breaks QtCore in the frozen program.
+windows = Path(os.environ["SystemRoot"])
+os.environ["PATH"] = os.pathsep.join(
+    str(path) for path in (Path(sys.prefix), Path(sys.base_prefix), windows / "System32", windows)
+)
 
 packaging = Path(SPECPATH)
 source = packaging.parent

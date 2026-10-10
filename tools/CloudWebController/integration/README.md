@@ -20,9 +20,9 @@
 
 ## 构建
 
-完整 Windows 包由 `.github/workflows/cloudweb-maaend.yml` 构建；不使用旧的独立工具包作为交付程序。
+完整 Windows 包在本地 Windows 构建；本实验分支已移除 push 自动构建触发。`.github/workflows/cloudweb-maaend.yml` 保留为构建步骤参考，不触发 GitHub Actions。交付入口为完整包内的 `MaaEnd.exe`。
 
-MXU 基线固定为 `MistEO/MXU@9fa8cc51e8ff8cd89d99f3ea55fe3a7a82e6ede3`，`mxu.patch` 包含客户端修改。工作流从相同 MaaEnd 源码构建 Go/C++ Agent、资源及内部网页组件，再组装 `MaaEnd.exe` 完整目录。
+MXU 基线固定为 `MistEO/MXU@9fa8cc51e8ff8cd89d99f3ea55fe3a7a82e6ede3`，`mxu.patch` 包含客户端修改。本地从相同 MaaEnd 源码构建 Go/C++ Agent、资源及内部网页组件，再组装 `MaaEnd.exe` 完整目录。
 
 开发检查包括前端类型/构建、客户端配置验证、Go 控制器测试、内部宿主协议与原生输入测试，以及真实 Rust Tasker 与网页组件的集成测试。构建产物里的验证报告是具体运行结果；不能用编译通过代替游戏兼容性测试。
 
@@ -39,3 +39,11 @@ MXU 基线固定为 `MistEO/MXU@9fa8cc51e8ff8cd89d99f3ea55fe3a7a82e6ede3`，`mxu
 ## 已知边界
 
 登录、排队、DRM、云服务手柄映射、Pointer Lock、GPU/解码能力及网络延迟需要针对真实服务再验证。浏览器窗口隐藏或最小化时会拒绝截图和输入，不能声称最小化后台运行。离线页和本地 WebRTC 回环只能验证桥接链路。
+
+## Windows 本地构建目录
+
+本次开发检出位于 `G:\DevProject\MaaEnd`，隔离 Python 环境、Go 工具链、pnpm、SDK 和新增下载缓存位于 `G:\DevData\MaaEnd`。已有 Rust 工具链和注册表缓存继续使用 `G:\DevData\Rust`。仅对构建进程设置 PATH，不修改系统 PATH。
+
+本地执行上述工作流中的命令体，分别生成 `build-cloudweb-inputs/mxu`、`build-cloudweb-inputs/maaend-runtime` 和 `build-cloudweb-inputs/qt-host`。最后依次执行 `build_full_package.py` 的 `assemble`、`test-native`、`seed-ui-check`，运行 `capture_window.ps1` 并人工检查主界面截图后，执行 `archive`。
+
+界面验证使用临时的 `config/mxu-MaaEnd.json`。打包时恢复干净配置，不保留验证实例或浏览器缓存。主程序目录为 `build-cloudweb-full/MaaEnd-CloudWeb`，便携 ZIP 和校验值位于 `build-cloudweb-full/deliverables`。

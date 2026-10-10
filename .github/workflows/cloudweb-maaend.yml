@@ -1,14 +1,6 @@
 name: Full MaaEnd CloudWeb Windows experiment
 
 on:
-  push:
-    branches:
-      - "experiment/cloud-web-controller-20261010"
-    paths:
-      - ".github/workflows/cloudweb-maaend.yml"
-      - "tools/CloudWebController/**"
-      - "assets/**"
-      - "agent/**"
   workflow_dispatch:
 
 permissions:
