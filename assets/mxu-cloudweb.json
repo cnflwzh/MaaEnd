@@ -1,0 +1,53 @@
+{
+    "schema_version": 1,
+    "controller": {
+        "name": "CloudWeb",
+        "label": "$controller.CloudWeb.label"
+    },
+    "compatible_tasks": [
+        "AeroSalvage",
+        "AutoCollect",
+        "AutoEcoFarm",
+        "AutoSell",
+        "AutoStockStaple",
+        "AutoStockpile",
+        "BakerEntry",
+        "BatchAddFriends",
+        "BatchUseDetector",
+        "ClaimSimulationRewards",
+        "Crafting",
+        "CreditShoppingN2",
+        "DailyRewards",
+        "DecomposeWeaponEssence",
+        "DeliveryJobs",
+        "DijiangRewards",
+        "EnvironmentMonitoring",
+        "EssenceFilter",
+        "GearAssembly",
+        "GiftOperator",
+        "ImportBluePrints",
+        "IntelArchive",
+        "ItemTransfer",
+        "ProtocolSpace",
+        "PullCountCalculator",
+        "PuzzleSolver",
+        "ReadAllWiki",
+        "RealTimeTask",
+        "ReceiveProdManual",
+        "ResourceRecycleStation",
+        "SeizeDeliveryJobs",
+        "SellProduct",
+        "SharedZiplineDelete",
+        "SimpleProductionBatchStart",
+        "StashBackpack",
+        "SwitchTeam",
+        "TrialOfSwordmancy",
+        "VisitFriends",
+        "WeaponUpgrade",
+        "ZiplineImport"
+    ],
+    "compatible_options": [
+        "AutoCollectMode",
+        "AutoCollectTargetInventory"
+    ]
+}

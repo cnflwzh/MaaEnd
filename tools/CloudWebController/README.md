@@ -1,6 +1,6 @@
 # CloudWebController：三端嵌入网页控制器实验
 
-**这不是已完成的云终末地适配。** 本目录是 fork 内独立、默认不参与发布的实验入口。官方网页入口与真实游戏画面尚未提供；登录、排队、DRM、Pointer Lock 和现有任务兼容性不能靠本地测试页推定。
+当前交付目标是原 MaaEnd 界面的完整集成包，见 [集成构建与开发规范](integration/README.md)。下列独立入口保留为内部开发检查，不作为完整程序交付。官方网页入口与真实游戏画面尚未提供；登录、排队、DRM、Pointer Lock 和任务兼容性不能靠本地测试页推定。
 
 ## 当前结构
 
@@ -11,9 +11,9 @@
 - `qt_main.py`、`fixture.html`：端到端检查、诊断截图与命令行实验入口
 - C++ 文件：先做的 Windows 原生 WebView2 实验后端，独立保留；尚未在 Windows 编译/运行
 
-MaaEnd 的 GUI 来自发布时下载的外部 MXU，并不是本仓库内的 Tauri 应用。Project Interface V2 没有可直接交给 MXU 实例化的 `Custom`/`WebView2` 类型。因此本次**没有**向 `assets/interface.json` 写入无效类型，没有更改现有控制器、Agent、任务、Pipeline 或发布构建。
+MaaEnd 的 GUI 来自发布时下载的外部 MXU，并不是本仓库内的 Tauri 应用。Project Interface V2 没有可直接交给 MXU 实例化的 `Custom`/`WebView2` 类型。集成版使用独立的 `mxu-cloudweb.json` 客户端配置及可重现的 MXU 补丁，不向 `assets/interface.json` 写入无效类型。
 
-要成为正式功能，仍需与 MXU 宿主连接选择器、任务运行器及打包集成。本工具当前只连接 Maa 控制器，不会运行 MaaEnd 游戏任务。
+完整程序通过 MXU 原有连接选择器创建自定义控制器，再由原 Tasker/Agent 运行原任务。`mxu_host.py` 是包内浏览器组件；下文 `qt_main.py` 独立测试入口不运行游戏任务。
 
 ## 快速运行共用 Qt 入口
 

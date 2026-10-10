@@ -14,6 +14,7 @@ func TestControlTypeFromPIType(t *testing.T) {
 		{"win32", " Win32 ", CONTROL_TYPE_WIN32},
 		{"macos", "MacOS", CONTROL_TYPE_MACOS},
 		{"linux", "LINUX", CONTROL_TYPE_LINUX},
+		{"cloud web", " CloudWeb ", CONTROL_TYPE_CLOUD_WEB},
 		{"unknown", "unknown", ""},
 	}
 	for _, c := range cases {
@@ -32,6 +33,7 @@ func TestControlTypeFromInfo(t *testing.T) {
 		want string
 	}{
 		{"win32", `{"type":"win32","hwnd":1}`, CONTROL_TYPE_WIN32},
+		{"cloud web", `{"type":"cloudweb","backend":"QtWebEngine"}`, CONTROL_TYPE_CLOUD_WEB},
 		{"adb", `{"type":"adb","adb_serial":"127.0.0.1:5555"}`, CONTROL_TYPE_ADB},
 		// MaaFwApp 在手机上用的 Android 原生控制器：触控 + 移动端 UI，按 ADB 处理
 		{"native android", `{"type":"native_android","display_id":0,"touch_resolution":{"width":1280,"height":720}}`, CONTROL_TYPE_ADB},

@@ -19,12 +19,19 @@ def validate_webengine_environment(environment, arguments=()) -> None:
         raise ValueError("Remote debugging must not be enabled for this host")
     if environment.get("QTWEBENGINE_DISABLE_SANDBOX"):
         raise ValueError("The embedded browser sandbox must remain enabled")
-    flags = environment.get("QTWEBENGINE_CHROMIUM_FLAGS", "") + " " + " ".join(arguments)
+    inherited = environment.get("QTWEBENGINE_CHROMIUM_FLAGS", "").split()
+    if any(flag != "--disable-gpu" for flag in inherited):
+        raise ValueError("Inherited Chromium overrides are forbidden except --disable-gpu")
+    flags = " ".join(arguments)
     if any(flag in flags for flag in (
         "--no-sandbox", "--disable-setuid-sandbox", "--disable-namespace-sandbox",
         "--disable-gpu-sandbox", "--remote-debugging",
+        "--ignore-certificate-errors", "--disable-web-security",
+        "--allow-running-insecure-content", "--allow-file-access-from-files",
+        "--single-process", "--enable-features", "--disable-features",
+        "--allow-insecure-localhost", "--webEngineArgs",
     )):
-        raise ValueError("Sandbox-disabling and remote-debugging flags are forbidden")
+        raise ValueError("Sandbox, certificate, web-security bypass and remote-debugging flags are forbidden")
 
 
 def https_origin(url: str) -> str:
@@ -74,5 +81,23 @@ def supported_key(code: int) -> bool:
         0x41 <= code <= 0x5A
         or 0x30 <= code <= 0x39
         or 0x25 <= code <= 0x28
-        or code in (0x08, 0x09, 0x0D, 0x1B, 0x20)
+        or 0x70 <= code <= 0x7B
+        or 0xA0 <= code <= 0xA5
+        or code in (0x08, 0x09, 0x0D, 0x10, 0x11, 0x12, 0x1B, 0x20)
     )
+
+
+def canonical_key(code: int) -> int:
+    """Map Maa's left/right Win32 modifiers to their Qt modifier family."""
+    return {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11, 0xA4: 0x12, 0xA5: 0x12}.get(code, code)
+
+
+def bounded_int(value, minimum, maximum, label):
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise ValueError(f"{label} must be an integer between {minimum} and {maximum}")
+    return value
+
+
+def mouse_contact(contact, *, hover=False):
+    """Maa desktop contact IDs: left, right, middle; -1 is hover only."""
+    return bounded_int(contact, -1 if hover else 0, 2, "Mouse contact")

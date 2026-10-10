@@ -91,7 +91,7 @@ func NewControlAdaptor(ctx *maa.Context, ctrl *maa.Controller, w, h int) (Contro
 	}
 
 	switch controlType {
-	case CONTROL_TYPE_WIN32:
+	case CONTROL_TYPE_WIN32, CONTROL_TYPE_CLOUD_WEB:
 		return newDefaultDesktopControlAdaptor(ctx, ctrl, w, h), nil
 	case CONTROL_TYPE_MACOS:
 		return newMacOSControlAdaptor(ctx, ctrl, w, h), nil

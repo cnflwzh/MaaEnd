@@ -4,6 +4,7 @@
     "controller.ADB.label": "安卓端",
     "controller.CloudADB.description": "用于云终末地客户端，通过安卓 ADB 连接。正在测试中。",
     "controller.CloudADB.label": "云终末地(ADB)(测试版)",
+    "controller.CloudWeb.label": "云·终末地网页版",
     "controller.Linux-Gamescope.description": "适用于 Gamescope",
     "controller.Linux-Gamescope.label": "Linux端-Gamescope",
     "controller.Linux-ScreenCast.description": "建议仅在 wlroots 和 gamescope 无法使用时替代。需要游戏在显示器上全屏运行；需要用户拥有 input 权限。",

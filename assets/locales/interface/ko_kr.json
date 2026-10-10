@@ -4,6 +4,7 @@
     "controller.ADB.label": "Android",
     "controller.CloudADB.description": "클라우드 종말지 클라이언트용. Android ADB로 연결합니다. 현재 테스트 중입니다.",
     "controller.CloudADB.label": "클라우드 종말지(ADB)(테스트판)",
+    "controller.CloudWeb.label": "클라우드 엔드필드 웹",
     "controller.Linux-Gamescope.description": "Gamescope용입니다.",
     "controller.Linux-Gamescope.label": "Linux-Gamescope",
     "controller.Linux-ScreenCast.description": "wlroots와 Gamescope를 사용할 수 없을 때만 대체로 권장됩니다. 게임은 디스플레이에서 전체 화면으로 실행해야 하며, 사용자에게 input 권한이 필요합니다.",

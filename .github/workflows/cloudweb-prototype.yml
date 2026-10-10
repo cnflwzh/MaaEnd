@@ -1,12 +1,6 @@
 name: CloudWeb Windows portable prototype
 
 on:
-  push:
-    branches:
-      - "experiment/cloud-web-controller-20261010"
-    paths:
-      - ".github/workflows/cloudweb-prototype.yml"
-      - "tools/CloudWebController/**"
   workflow_dispatch:
 
 permissions:

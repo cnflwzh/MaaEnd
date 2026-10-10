@@ -458,6 +458,9 @@ enc_temp_folder/*
 install/
 maafw/*
 mxu*
+!assets/mxu-cloudweb.json
+!tools/CloudWebController/mxu_host.py
+!tools/CloudWebController/integration/mxu.patch
 deps
 deps-android
 3rdparty

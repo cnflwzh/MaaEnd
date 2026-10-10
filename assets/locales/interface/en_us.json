@@ -4,6 +4,7 @@
     "controller.ADB.label": "Android",
     "controller.CloudADB.description": "For the Cloud Endfield client over Android ADB. Currently under testing.",
     "controller.CloudADB.label": "Cloud Endfield (ADB) (Beta)",
+    "controller.CloudWeb.label": "Cloud Endfield Web",
     "controller.Linux-Gamescope.description": "For Gamescope.",
     "controller.Linux-Gamescope.label": "Linux-Gamescope",
     "controller.Linux-ScreenCast.description": "Recommended only as a fallback when wlroots and Gamescope are unavailable. The game must run fullscreen on the display; the user needs input permissions.",

@@ -96,6 +96,16 @@ func (c *AspectRatioChecker) OnTaskerTask(tasker *maa.Tasker, event maa.EventSta
 			Msg("Detected controller type for aspect ratio check")
 	}
 
+	// CloudWeb has a fixed view-local viewport. Never inspect or modify the
+	// locally installed game's registry/fullscreen state for a remote webpage.
+	if controlType == control.CONTROL_TYPE_CLOUD_WEB {
+		if int(width) != targetWidth || int(height) != targetHeight {
+			c.stopWithWarning(tasker, controllerDisplay, int(width), int(height),
+				i18n.T("tasker.aspect_ratio_warning.requirement_exact", targetWidth, targetHeight))
+		}
+		return
+	}
+
 	if isADBController {
 		requirement := i18n.T("tasker.aspect_ratio_warning.requirement_exact", targetWidth, targetHeight)
 		log.Debug().
@@ -572,6 +582,8 @@ func displayControllerType(controllerType string) string {
 		return "Win32"
 	case control.CONTROL_TYPE_LINUX:
 		return "Linux"
+	case control.CONTROL_TYPE_CLOUD_WEB:
+		return "CloudWeb"
 	default:
 		return controllerType
 	}
@@ -585,6 +597,8 @@ func normalizeControllerType(controllerType string) string {
 		return control.CONTROL_TYPE_WIN32
 	case "linux":
 		return control.CONTROL_TYPE_LINUX
+	case "cloudweb":
+		return control.CONTROL_TYPE_CLOUD_WEB
 	default:
 		return ""
 	}

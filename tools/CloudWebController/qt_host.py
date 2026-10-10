@@ -10,16 +10,17 @@ behavior requires platform testing; hidden/minimized rendering is unsupported.
 from dataclasses import dataclass, field
 import os
 from threading import Condition, Event
+import time
 from typing import Any, Callable
 
 import numpy as np
-from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, QPointF, QThread, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QImage, QInputMethodEvent, QKeyEvent, QMouseEvent
+from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, QObject, QPoint, QPointF, QThread, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QImage, QInputMethodEvent, QKeyEvent, QMouseEvent, QWheelEvent
 from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
 
-from qt_policy import VIEWPORT_HEIGHT, VIEWPORT_WIDTH, allowed_origins as make_origins, https_origin, inside_viewport, safe_load_error, supported_key, validate_webengine_environment
+from qt_policy import VIEWPORT_HEIGHT, VIEWPORT_WIDTH, allowed_origins as make_origins, bounded_int, canonical_key, https_origin, inside_viewport, mouse_contact, safe_load_error, supported_key, validate_webengine_environment
 
 
 @dataclass(eq=False)
@@ -111,6 +112,7 @@ class QtBrowserHost(QObject):
     closed = Signal()
     _requested = Signal(object)
     _close_requested = Signal()
+    _release_requested = Signal()
 
     def __init__(self, url=None, test_html=None, profile=None, allowed_origins=()):
         app = QApplication.instance()
@@ -119,7 +121,9 @@ class QtBrowserHost(QObject):
         validate_webengine_environment(os.environ, app.arguments())
         if (url is None) == (test_html is None):
             raise ValueError("Provide exactly one explicit HTTPS URL or offline test_html")
-        super().__init__()
+        # A worker may hold the last Python reference returned by call_on_ui.
+        # Native WebEngine objects must still be destroyed by the UI owner.
+        super().__init__(app)
         self._state = Condition()
         self._pending: set[_UiCall] = set()
         self._closed = False
@@ -127,6 +131,9 @@ class QtBrowserHost(QObject):
         self._ready = False
         self._load_error: str | None = None
         self._navigation_error: str | None = None
+        self._held_keys: set[int] = set()
+        self._held_contacts: set[int] = set()
+        self._pointer = QPoint(VIEWPORT_WIDTH // 2, VIEWPORT_HEIGHT // 2)
         origins = make_origins(url, allowed_origins) if url is not None else frozenset()
         if url is None and allowed_origins:
             raise ValueError("Offline mode cannot allow remote origins")
@@ -179,6 +186,7 @@ class QtBrowserHost(QObject):
         app.aboutToQuit.connect(self._shutdown)
         self._requested.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
         self._close_requested.connect(self.view.close, Qt.ConnectionType.QueuedConnection)
+        self._release_requested.connect(self._release_inputs, Qt.ConnectionType.QueuedConnection)
         if url is None:
             self.view.setHtml(test_html)
         else:
@@ -209,6 +217,10 @@ class QtBrowserHost(QObject):
                     self._state.notify_all()
                     self._pending.discard(request)
                     request.done.set()
+                    # A prior key/button may still be held when another UI
+                    # operation times out. Release it once the UI recovers;
+                    # never retry the timed-out action or re-enable input.
+                    self._release_requested.emit()
         if request.error is not None:
             raise request.error
         return request.result
@@ -254,6 +266,7 @@ class QtBrowserHost(QObject):
 
     @Slot()
     def _load_started(self):
+        self._release_inputs()
         with self._state:
             self._ready = False
             self._load_error = None
@@ -329,16 +342,28 @@ class QtBrowserHost(QObject):
         if self.view.width() != VIEWPORT_WIDTH or self.view.height() != VIEWPORT_HEIGHT:
             raise RuntimeError("Embedded browser viewport must remain exactly 1280x720")
 
+    def _capture_image(self):
+        self._check_surface()
+        image = self.view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
+        if image.isNull():
+            raise RuntimeError("Embedded browser returned an empty screenshot")
+        # Logical input coordinates always match the returned Maa viewport.
+        if image.width() != VIEWPORT_WIDTH or image.height() != VIEWPORT_HEIGHT:
+            image = image.scaled(VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return image
+
+    def capture_png(self):
+        def grab():
+            data = QByteArray()
+            buffer = QBuffer(data)
+            if not buffer.open(QIODevice.OpenModeFlag.WriteOnly) or not self._capture_image().save(buffer, "PNG"):
+                raise RuntimeError("Embedded screenshot PNG encoding failed")
+            return bytes(data)
+        return self.call_on_ui(grab)
+
     def capture(self):
         def grab():
-            self._check_surface()
-            image = self.view.grab().toImage().convertToFormat(QImage.Format.Format_RGB888)
-            if image.isNull():
-                raise RuntimeError("Embedded browser returned an empty screenshot")
-            # High-DPI screens have more physical pixels than logical input
-            # coordinates. Normalize pixels to the fixed Maa viewport.
-            if image.width() != VIEWPORT_WIDTH or image.height() != VIEWPORT_HEIGHT:
-                image = image.scaled(VIEWPORT_WIDTH, VIEWPORT_HEIGHT, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            image = self._capture_image()
             rows = np.frombuffer(image.constBits(), dtype=np.uint8, count=image.sizeInBytes()).reshape(image.height(), image.bytesPerLine())
             rgb = rows[:, :VIEWPORT_WIDTH * 3].reshape(VIEWPORT_HEIGHT, VIEWPORT_WIDTH, 3)
             return rgb[:, :, ::-1].copy()  # Own storage before QImage is destroyed.
@@ -354,27 +379,185 @@ class QtBrowserHost(QObject):
         if not inside_viewport(x, y):
             raise ValueError("Click is outside the 1280x720 viewport")
         def send():
+            if 0 in self._held_contacts:
+                raise RuntimeError("Cannot click while the left button is held")
+            self._input_target()
+            self._pointer = QPoint(x, y)
+            self._held_contacts.add(0)
+            self._mouse_event(QEvent.Type.MouseButtonPress, 0)
+            self._held_contacts.remove(0)
+            self._mouse_event(QEvent.Type.MouseButtonRelease, 0)
+            return True
+        return self.call_on_ui(send)
+
+    def _modifiers(self):
+        modifiers = Qt.KeyboardModifier.NoModifier
+        held = {canonical_key(code) for code in self._held_keys}
+        for code, flag in ((0x10, Qt.KeyboardModifier.ShiftModifier), (0x11, Qt.KeyboardModifier.ControlModifier), (0x12, Qt.KeyboardModifier.AltModifier)):
+            if code in held:
+                modifiers |= flag
+        return modifiers
+
+    @staticmethod
+    def _button(contact):
+        return {0: Qt.MouseButton.LeftButton, 1: Qt.MouseButton.RightButton, 2: Qt.MouseButton.MiddleButton}.get(contact, Qt.MouseButton.NoButton)
+
+    def _buttons(self):
+        buttons = Qt.MouseButton.NoButton
+        for contact in self._held_contacts:
+            buttons |= self._button(contact)
+        return buttons
+
+    def _mouse_event(self, event_type, contact=-1):
+        target = self.view.focusProxy() or self.view
+        point = target.mapFrom(self.view, self._pointer)
+        event = QMouseEvent(event_type, QPointF(point), QPointF(target.mapToGlobal(point)), self._button(contact), self._buttons(), self._modifiers())
+        QCoreApplication.sendEvent(target, event)
+
+    def touch_down(self, contact, x, y, pressure=1):
+        mouse_contact(contact)
+        bounded_int(pressure, 0, 0x7FFFFFFF, "Pressure")
+        if not inside_viewport(x, y):
+            raise ValueError("Pointer is outside the 1280x720 viewport")
+        def send():
+            self._input_target()
+            if contact in self._held_contacts:
+                raise RuntimeError("Mouse button is already held")
+            self._pointer = QPoint(x, y)
+            self._held_contacts.add(contact)
+            self._mouse_event(QEvent.Type.MouseButtonPress, contact)
+            return True
+        return self.call_on_ui(send)
+
+    def touch_move(self, contact, x, y, pressure=0):
+        mouse_contact(contact, hover=True)
+        bounded_int(pressure, 0, 0x7FFFFFFF, "Pressure")
+        if not inside_viewport(x, y):
+            raise ValueError("Pointer is outside the 1280x720 viewport")
+        def send():
+            self._input_target()
+            self._pointer = QPoint(x, y)
+            # Motion never implies a press. Actual held buttons determine drag.
+            self._mouse_event(QEvent.Type.MouseMove)
+            return True
+        return self.call_on_ui(send)
+
+    def touch_up(self, contact):
+        mouse_contact(contact)
+        def send():
+            self._input_target()
+            if contact in self._held_contacts:
+                self._held_contacts.remove(contact)
+                self._mouse_event(QEvent.Type.MouseButtonRelease, contact)
+            return True
+        return self.call_on_ui(send)
+
+    def swipe(self, x1, y1, x2, y2, duration):
+        bounded_int(duration, 0, 10000, "Swipe duration (milliseconds)")
+        if not inside_viewport(x1, y1) or not inside_viewport(x2, y2):
+            raise ValueError("Swipe is outside the 1280x720 viewport")
+        if self._is_ui():
+            raise RuntimeError("Swipe must run on the controller worker")
+        self.touch_down(0, x1, y1)
+        try:
+            # Timing defines the gesture, not a blind wait for page state.
+            steps = max(1, (duration + 15) // 16)
+            start = time.monotonic()
+            for step in range(1, steps + 1):
+                deadline = start + duration / 1000 * step / steps
+                with self._state:
+                    if self._state.wait_for(lambda: self._closed, max(0, deadline - time.monotonic())):
+                        self._ensure_open()
+                self.touch_move(0, round(x1 + (x2 - x1) * step / steps), round(y1 + (y2 - y1) * step / steps))
+            return True
+        finally:
+            if self.connected():
+                self.touch_up(0)
+
+    def relative_move(self, dx, dy):
+        """Bounded view-local movement, NOT raw/pointer-lock camera input."""
+        bounded_int(dx, -32767, 32767, "Relative x")
+        bounded_int(dy, -32767, 32767, "Relative y")
+        def send():
+            self._input_target()
+            self._pointer = QPoint(max(0, min(VIEWPORT_WIDTH - 1, self._pointer.x() + dx)), max(0, min(VIEWPORT_HEIGHT - 1, self._pointer.y() + dy)))
+            self._mouse_event(QEvent.Type.MouseMove)
+            return True
+        return self.call_on_ui(send)
+
+    def scroll(self, dx, dy):
+        bounded_int(dx, -32767, 32767, "Scroll x")
+        bounded_int(dy, -32767, 32767, "Scroll y")
+        def send():
             target = self._input_target()
-            point = target.mapFrom(self.view, QPoint(x, y))
-            local, global_point = QPointF(point), QPointF(target.mapToGlobal(point))
-            for event_type, buttons in ((QEvent.Type.MouseButtonPress, Qt.MouseButton.LeftButton), (QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton)):
-                event = QMouseEvent(event_type, local, global_point, Qt.MouseButton.LeftButton, buttons, Qt.KeyboardModifier.NoModifier)
-                QCoreApplication.sendEvent(target, event)
+            point = target.mapFrom(self.view, self._pointer)
+            event = QWheelEvent(QPointF(point), QPointF(target.mapToGlobal(point)), QPoint(), QPoint(-dx, -dy), self._buttons(), self._modifiers(), Qt.ScrollPhase.NoScrollPhase, False)
+            QCoreApplication.sendEvent(target, event)
             return True
         return self.call_on_ui(send)
 
     def key(self, code, down):
         if not supported_key(code):
-            raise ValueError("Only A-Z, 0-9, arrows, space, enter, escape, tab and backspace are supported")
-        keys = {0x08: Qt.Key.Key_Backspace, 0x09: Qt.Key.Key_Tab, 0x0D: Qt.Key.Key_Return, 0x1B: Qt.Key.Key_Escape, 0x20: Qt.Key.Key_Space, 0x25: Qt.Key.Key_Left, 0x26: Qt.Key.Key_Up, 0x27: Qt.Key.Key_Right, 0x28: Qt.Key.Key_Down}
-        qt_key = keys.get(code, code)
-        value = chr(code).lower() if 0x30 <= code <= 0x5A else {0x20: " ", 0x0D: "\r", 0x09: "\t", 0x08: "\b"}.get(code, "")
+            raise ValueError("Supported keys: A-Z, 0-9, F1-F12, arrows, Shift/Ctrl/Alt (including left/right aliases), space, enter, escape, tab, backspace")
         def send():
-            target = self._input_target()
-            event = QKeyEvent(QEvent.Type.KeyPress if down else QEvent.Type.KeyRelease, qt_key, Qt.KeyboardModifier.NoModifier, value)
-            QCoreApplication.sendEvent(target, event)
+            self._input_target()
+            family = canonical_key(code)
+            was_held = any(canonical_key(key) == family for key in self._held_keys)
+            if down:
+                if code in self._held_keys:
+                    return True
+                self._held_keys.add(code)
+                if was_held:
+                    return True
+            else:
+                if code not in self._held_keys:
+                    return True
+                self._held_keys.discard(code)
+                if any(canonical_key(key) == family for key in self._held_keys):
+                    return True
+            self._key_event(code, down)
             return True
         return self.call_on_ui(send)
+
+    def _key_event(self, code, down):
+        code = canonical_key(code)
+        keys = {0x08: Qt.Key.Key_Backspace, 0x09: Qt.Key.Key_Tab, 0x0D: Qt.Key.Key_Return, 0x10: Qt.Key.Key_Shift, 0x11: Qt.Key.Key_Control, 0x12: Qt.Key.Key_Alt, 0x1B: Qt.Key.Key_Escape, 0x20: Qt.Key.Key_Space, 0x25: Qt.Key.Key_Left, 0x26: Qt.Key.Key_Up, 0x27: Qt.Key.Key_Right, 0x28: Qt.Key.Key_Down}
+        if 0x70 <= code <= 0x7B:
+            keys[code] = int(Qt.Key.Key_F1) + code - 0x70
+        held = {canonical_key(key) for key in self._held_keys}
+        value = chr(code).lower() if 0x30 <= code <= 0x5A else {0x20: " ", 0x0D: "\r", 0x09: "\t", 0x08: "\b"}.get(code, "")
+        if 0x10 in held:
+            value = value.upper()
+            if 0x30 <= code <= 0x39:
+                value = ")!@#$%^&*("[code - 0x30]
+        if 0x11 in held or 0x12 in held:
+            value = ""
+        event = QKeyEvent(QEvent.Type.KeyPress if down else QEvent.Type.KeyRelease, keys.get(code, code), self._modifiers(), value)
+        QCoreApplication.sendEvent(self.view.focusProxy() or self.view, event)
+
+    def click_key(self, code):
+        if not supported_key(code):
+            raise ValueError("Unsupported key code")
+        if self.call_on_ui(lambda: any(canonical_key(key) == canonical_key(code) for key in self._held_keys)):
+            raise RuntimeError("Cannot click a key that is already held")
+        return self.key(code, True) and self.key(code, False)
+
+    @Slot()
+    def _release_inputs(self):
+        # Cleanup must still work after navigation, hide/minimize or a fault.
+        for contact in tuple(self._held_contacts):
+            self._held_contacts.remove(contact)
+            self._mouse_event(QEvent.Type.MouseButtonRelease, contact)
+        # Release ordinary keys before modifiers, retaining chord semantics.
+        for code in sorted(self._held_keys, key=lambda code: canonical_key(code) in (0x10, 0x11, 0x12)):
+            self._held_keys.remove(code)
+            if not any(canonical_key(key) == canonical_key(code) for key in self._held_keys):
+                self._key_event(code, False)
+        return True
+
+    def inactive(self):
+        """Release every held input without destroying this reusable browser."""
+        return self.call_on_ui(self._release_inputs)
 
     def text(self, value):
         if not isinstance(value, str) or len(value) > 4096:
@@ -389,6 +572,8 @@ class QtBrowserHost(QObject):
 
     @Slot()
     def _shutdown(self):
+        if not self._closed:
+            self._release_inputs()
         with self._state:
             if self._closed:
                 return

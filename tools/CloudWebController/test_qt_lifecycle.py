@@ -66,6 +66,8 @@ def main():
 
             # Queue a timed-out operation behind an intentionally busy UI slot.
             # The expired callback must not run once that slot releases.
+            host.key(0x57, True)
+            host.touch_down(0, 400, 300)
             called = threading.Event()
             timed_out = threading.Event()
             def request_late():
@@ -81,6 +83,7 @@ def main():
             time.sleep(0.05)
             check("timeout_reported", timed_out.is_set())
             check("timed_out_callback_skipped", not called.is_set())
+            check("timeout_releases_held_input", host.call_on_ui(lambda: not host._held_keys and not host._held_contacts))
             check("input_disabled_after_timeout", not host.connected() and rejected(lambda: host.click(20, 20)))
 
             waiting_started = threading.Event()

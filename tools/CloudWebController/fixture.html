@@ -13,12 +13,14 @@ button{position:absolute;left:100px;top:280px;width:300px;height:160px;border:1p
 #stream{position:absolute;left:560px;top:260px;width:640px;height:360px;border:1px solid #334155;border-radius:12px;background:#020617}
 #streamlabel{position:absolute;left:560px;top:226px;font-size:14px;letter-spacing:1px;color:#94a3b8}
 input{position:absolute;left:100px;top:575px;width:380px;height:40px;background:#172136;color:#fff;border:1px solid #64748b;padding:8px;font-size:17px}
+#marker{position:absolute;left:20px;top:650px;width:20px;height:20px;background:rgb(225,29,72)}
 footer{position:absolute;bottom:30px;left:44px;font-size:14px;color:#64748b}
 </style>
 </head>
 <body>
 <header><div class="pill">EXPERIMENTAL · EMBEDDED BROWSER · 1280 × 720</div><h1>MaaEnd <span>Cloud Web Bridge</span></h1><div class="sub">Offline validation surface. Native input → Maa custom controller → embedded renderer.<br>No cloud game is connected. The video below is a local {{VIDEO_DESCRIPTION}}.</div></header>
 <button id="target">Click target</button><div id="state">Clicks: 0<br>Keyboard: waiting</div>
+<div id="marker" aria-label="Offline recognition state"></div>
 <div id="streamlabel">{{VIDEO_LABEL}}</div>
 <video id="stream" autoplay muted playsinline></video><canvas id="source" width="640" height="360" hidden></canvas>
 <input id="text" placeholder="Native text-input bridge test"><footer>WINDOWS / macOS / LINUX · SHARED QtWebEngine HOST · NO PAGE-TO-HOST API</footer>
@@ -26,7 +28,7 @@ footer{position:absolute;bottom:30px;left:44px;font-size:14px;color:#64748b}
 let clicks=0, keys=0, frames=0;
 const state=document.getElementById('state');
 function status(){state.innerHTML='Clicks: '+clicks+'<br>Keyboard W: '+keys}
-document.getElementById('target').onclick=()=>{clicks++;status();document.title='MaaEnd bridge: clicked '+clicks};
+document.getElementById('target').onclick=()=>{clicks++;status();document.getElementById('marker').style.background=clicks===1?'rgb(34,197,94)':'rgb(59,130,246)';document.title='MaaEnd bridge: clicked '+clicks};
 document.onkeydown=e=>{if(e.code==='KeyW'){keys++;status();document.title='MaaEnd bridge: key W '+keys}};
 document.getElementById('text').oninput=e=>{document.title='MaaEnd bridge: text '+e.target.value};
 const canvas=document.getElementById('source'), context=canvas.getContext('2d');

@@ -4,6 +4,7 @@
     "controller.ADB.label": "Android",
     "controller.CloudADB.description": "クラウド終末地クライアント向け。Android ADB で接続します。現在テスト中です。",
     "controller.CloudADB.label": "クラウド終末地(ADB)(テスト版)",
+    "controller.CloudWeb.label": "クラウド・エンドフィールド Web",
     "controller.Linux-Gamescope.description": "Gamescope 向けです。",
     "controller.Linux-Gamescope.label": "Linux-Gamescope",
     "controller.Linux-ScreenCast.description": "wlroots と Gamescope が使用できない場合の代替としてのみ推奨されます。ゲームはディスプレイ上で全画面実行する必要があり、ユーザーに input 権限が必要です。",

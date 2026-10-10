@@ -1,0 +1,2710 @@
+diff --git a/src-tauri/src/commands/cloud_web.rs b/src-tauri/src/commands/cloud_web.rs
+new file mode 100644
+index 0000000..40391de
+--- /dev/null
++++ b/src-tauri/src/commands/cloud_web.rs
+@@ -0,0 +1,626 @@
++//! Product-owned embedded browser controller. The remote page never receives an
++//! MXU API, executable path, socket, or MaaFramework handle.
++//!
++//! Only the browser surface lives in the child process. The existing MXU
++//! Controller, Resource, Tasker and AgentClient objects stay in this process.
++
++use base64::{engine::general_purpose::STANDARD, Engine};
++use maa_framework::controller::Controller;
++use maa_framework::custom_controller::CustomControllerCallback;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use std::io::{BufRead, BufReader, Write};
++use std::path::Path;
++use std::process::{Child, Command, Stdio};
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{mpsc, Arc, Mutex, Weak};
++use std::time::{Duration, Instant};
++
++const MAX_REQUEST_BYTES: usize = 64 * 1024;
++const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
++const ACTION_TIMEOUT: Duration = Duration::from_secs(12);
++const CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
++const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
++
++#[derive(Debug, Deserialize)]
++struct HostReply {
++    id: u64,
++    ok: bool,
++    #[serde(default)]
++    result: Value,
++    #[serde(default)]
++    error: Option<String>,
++}
++
++struct HostRequest {
++    id: u64,
++    line: Vec<u8>,
++    deadline: Instant,
++    reply: mpsc::SyncSender<Result<HostReply, String>>,
++}
++
++/// Explicit owner: MaaFramework 1.22 does not reclaim its boxed custom callback.
++/// Callbacks hold only Weak references, so dropping the instance closes/reaps
++/// the browser even while MaaFramework retains a callback allocation.
++pub struct CloudWebSession {
++    child: Mutex<Option<Child>>,
++    requests: mpsc::SyncSender<HostRequest>,
++    healthy: Arc<AtomicBool>,
++    ready: AtomicBool,
++    input_enabled: AtomicBool,
++    input_gate: Mutex<()>,
++    request_gate: Mutex<()>,
++    stop_epoch: AtomicU64,
++    pending_releases: AtomicUsize,
++    next_id: AtomicU64,
++    session_id: String,
++}
++
++fn normalized_url(url: &str) -> Result<String, String> {
++    if url.is_empty() || url == "bundled-fixture" {
++        return Ok("bundled-fixture".into());
++    }
++    if url.len() > 4096 || !url.is_ascii() || url.bytes().any(|b| b <= 32 || b == b'\\') {
++        return Err("CLOUD_WEB_INVALID_URL".into());
++    }
++    let parsed = reqwest::Url::parse(url).map_err(|_| "CLOUD_WEB_INVALID_URL")?;
++    if parsed.scheme() != "https"
++        || parsed.host_str().is_none()
++        || !parsed.username().is_empty()
++        || parsed.password().is_some()
++        || parsed.port().is_some_and(|port| port != 443)
++    {
++        return Err("CLOUD_WEB_INVALID_URL".into());
++    }
++    Ok(url.to_string())
++}
++
++/// Read one bounded line without allowing read_until to allocate unbounded data.
++fn read_bounded_line<R: BufRead>(reader: &mut R, limit: usize) -> Result<Vec<u8>, String> {
++    let mut result = Vec::new();
++    loop {
++        let available = reader.fill_buf().map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR")?;
++        if available.is_empty() {
++            return Err("CLOUD_WEB_DISCONNECTED".into());
++        }
++        let end = available.iter().position(|&b| b == b'\n');
++        let take = end.map_or(available.len(), |index| index + 1);
++        if result.len().saturating_add(take) > limit {
++            return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
++        }
++        result.extend_from_slice(&available[..take]);
++        reader.consume(take);
++        if end.is_some() {
++            return Ok(result);
++        }
++    }
++}
++
++impl CloudWebSession {
++    fn spawn(executable: &Path, url: &str, session_id: &str) -> Result<Arc<Self>, String> {
++        let url = normalized_url(url)?;
++        if session_id.is_empty()
++            || session_id.len() > 128
++            || !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
++        {
++            return Err("CLOUD_WEB_INVALID_SESSION".into());
++        }
++        if !executable.is_file() {
++            return Err("CLOUD_WEB_HOST_MISSING".into());
++        }
++        let mut command = Command::new(executable);
++        command.arg("--mxu-host").arg("--url").arg(url)
++            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
++        // Hide only the Python/stdio console. The Qt browser window stays visible.
++        #[cfg(windows)]
++        {
++            use std::os::windows::process::CommandExt;
++            command.creation_flags(0x0800_0000);
++        }
++        let mut child = command.spawn().map_err(|_| "CLOUD_WEB_START_FAILED")?;
++        let Some(mut stdin) = child.stdin.take() else {
++            let _ = child.kill();
++            let _ = child.wait();
++            return Err("CLOUD_WEB_START_FAILED".into());
++        };
++        let Some(stdout) = child.stdout.take() else {
++            let _ = child.kill();
++            let _ = child.wait();
++            return Err("CLOUD_WEB_START_FAILED".into());
++        };
++        let healthy = Arc::new(AtomicBool::new(true));
++        let (response_tx, response_rx) = mpsc::sync_channel(1);
++        let reader_health = healthy.clone();
++        std::thread::spawn(move || {
++            let mut reader = BufReader::new(stdout);
++            loop {
++                let result = read_bounded_line(&mut reader, MAX_RESPONSE_BYTES)
++                    .and_then(|line| serde_json::from_slice::<HostReply>(&line)
++                        .map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR".into()));
++                let failed = result.is_err();
++                if failed {
++                    reader_health.store(false, Ordering::Release);
++                }
++                // The host must send exactly one response per request.
++                if response_tx.try_send(result).is_err() {
++                    reader_health.store(false, Ordering::Release);
++                    break;
++                }
++                if failed { break; }
++            }
++        });
++        let (request_tx, request_rx) = mpsc::sync_channel::<HostRequest>(8);
++        let worker_health = healthy.clone();
++        std::thread::spawn(move || {
++            while let Ok(request) = request_rx.recv() {
++                if !worker_health.load(Ordering::Acquire) || Instant::now() >= request.deadline {
++                    let _ = request.reply.send(Err("CLOUD_WEB_DISCONNECTED".into()));
++                    continue;
++                }
++                let result = (|| {
++                    stdin.write_all(&request.line).and_then(|_| stdin.flush())
++                        .map_err(|_| "CLOUD_WEB_DISCONNECTED".to_string())?;
++                    let timeout = request.deadline.saturating_duration_since(Instant::now());
++                    let response = response_rx.recv_timeout(timeout)
++                        .map_err(|_| "CLOUD_WEB_TIMEOUT".to_string())??;
++                    if response.id != request.id {
++                        return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
++                    }
++                    Ok(response)
++                })();
++                if result.is_err() {
++                    worker_health.store(false, Ordering::Release);
++                }
++                let _ = request.reply.send(result);
++            }
++        });
++        Ok(Arc::new(Self {
++            child: Mutex::new(Some(child)), requests: request_tx, healthy,
++            ready: AtomicBool::new(false), input_enabled: AtomicBool::new(true),
++            input_gate: Mutex::new(()), request_gate: Mutex::new(()),
++            stop_epoch: AtomicU64::new(0), pending_releases: AtomicUsize::new(0),
++            next_id: AtomicU64::new(1), session_id: session_id.into(),
++        }))
++    }
++
++    fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
++        let deadline = Instant::now() + timeout;
++        let _guard = loop {
++            match self.request_gate.try_lock() {
++                Ok(guard) => break guard,
++                Err(std::sync::TryLockError::Poisoned(_)) => return Err("CLOUD_WEB_PROTOCOL_ERROR".into()),
++                Err(std::sync::TryLockError::WouldBlock) => {
++                    if Instant::now() >= deadline {
++                        return Err("CLOUD_WEB_BUSY".into());
++                    }
++                    std::thread::sleep(Duration::from_millis(5));
++                }
++            }
++        };
++        self.request_locked(method, params, deadline.saturating_duration_since(Instant::now()))
++    }
++
++    fn request_locked(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
++        if !self.healthy.load(Ordering::Acquire) {
++            self.shutdown();
++            return Err("CLOUD_WEB_DISCONNECTED".into());
++        }
++        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
++        let mut line = serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
++            .map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR")?;
++        line.push(b'\n');
++        if line.len() > MAX_REQUEST_BYTES {
++            return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
++        }
++        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
++        let request = HostRequest { id, line, deadline: Instant::now() + timeout, reply: reply_tx };
++        if self.requests.try_send(request).is_err() {
++            self.shutdown();
++            return Err("CLOUD_WEB_PROTOCOL_ERROR".into());
++        }
++        match reply_rx.recv_timeout(timeout) {
++            Ok(Ok(reply)) if reply.ok => Ok(reply.result),
++            Ok(Ok(reply)) => {
++                // Do not forward untrusted webpage text, URLs, or credentials to logs.
++                let _ = reply.error;
++                Err("CLOUD_WEB_REJECTED".into())
++            }
++            Ok(Err(error)) => { self.shutdown(); Err(error) }
++            Err(_) => {
++                // A timeout cannot retract input already dispatched. Kill the
++                // session so queued/late commands cannot execute after failure.
++                self.shutdown();
++                Err("CLOUD_WEB_TIMEOUT".into())
++            }
++        }
++    }
++
++    fn action(&self, method: &str, params: Value) -> bool {
++        let Ok(_guard) = self.input_gate.lock() else { return false; };
++        if !self.input_enabled.load(Ordering::Acquire) && method != "inactive" {
++            return false;
++        }
++        self.request(method, params, ACTION_TIMEOUT).ok().and_then(|v| v.as_bool()) == Some(true)
++    }
++
++    /// Stop queued input without closing the page, so the next run can reuse it.
++    pub fn pause_and_release_input(&self) -> bool {
++        self.begin_stop();
++        self.finish_stop_release()
++    }
++
++    pub fn begin_stop(&self) {
++        self.input_enabled.store(false, Ordering::Release);
++        self.pending_releases.fetch_add(1, Ordering::AcqRel);
++        self.stop_epoch.fetch_add(1, Ordering::AcqRel);
++    }
++
++    pub fn finish_stop_release(&self) -> bool {
++        let result = match self.input_gate.lock() {
++            Ok(_guard) => self.request("inactive", json!({}), ACTION_TIMEOUT)
++                .ok().and_then(|v| v.as_bool()) == Some(true),
++            Err(_) => false,
++        };
++        self.pending_releases.fetch_sub(1, Ordering::AcqRel);
++        result
++    }
++
++    pub fn stop_epoch(&self) -> u64 { self.stop_epoch.load(Ordering::Acquire) }
++
++    pub fn resume_input(&self) -> bool {
++        let Ok(_guard) = self.input_gate.try_lock() else { return false; };
++        if self.pending_releases.load(Ordering::Acquire) != 0 || !self.healthy.load(Ordering::Acquire) {
++            return false;
++        }
++        self.input_enabled.store(true, Ordering::Release);
++        true
++    }
++
++    pub fn shutdown(&self) {
++        self.ready.store(false, Ordering::Release);
++        self.healthy.store(false, Ordering::Release);
++        if let Ok(mut guard) = self.child.lock() {
++            if let Some(mut child) = guard.take() {
++                let _ = child.kill();
++                let _ = child.wait();
++            }
++        }
++    }
++}
++
++impl Drop for CloudWebSession {
++    fn drop(&mut self) { self.shutdown(); }
++}
++
++struct CloudWebCallback { session: Weak<CloudWebSession> }
++
++impl CloudWebCallback {
++    fn action(&self, method: &str, params: Value) -> bool {
++        self.session.upgrade().is_some_and(|session| session.action(method, params))
++    }
++}
++
++impl CustomControllerCallback for CloudWebCallback {
++    fn connect(&self) -> bool {
++        self.session.upgrade().is_some_and(|session| {
++            let ready = session.request("connect", json!({}), CONNECT_TIMEOUT)
++                .ok().and_then(|value| value.as_bool()) == Some(true);
++            session.ready.store(ready, Ordering::Release);
++            if !ready { session.shutdown(); }
++            ready
++        })
++    }
++    fn connected(&self) -> bool {
++        self.session.upgrade().is_some_and(|session| {
++            if !session.healthy.load(Ordering::Acquire) {
++                // EOF is also emitted when the user closes the browser window.
++                // Reap its process on the next normal state poll.
++                session.shutdown();
++                return false;
++            }
++            if !session.ready.load(Ordering::Acquire) {
++                return false;
++            }
++            // Status reads can occur on the GUI thread while Maa is swiping.
++            // Never queue a short health-check timeout behind a long action.
++            let _guard = match session.request_gate.try_lock() {
++                Ok(guard) => guard,
++                Err(std::sync::TryLockError::WouldBlock) => return true,
++                Err(std::sync::TryLockError::Poisoned(_)) => return false,
++            };
++            session.request_locked("connected", json!({}), STATUS_TIMEOUT)
++                .ok().and_then(|value| value.as_bool()) == Some(true)
++        })
++    }
++    fn request_uuid(&self) -> Option<String> {
++        self.session.upgrade().map(|session| format!("cloudweb:{}", session.session_id))
++    }
++    fn screencap(&self) -> Option<Vec<u8>> {
++        let session = self.session.upgrade()?;
++        let value = session.request("screencap", json!({}), ACTION_TIMEOUT).ok()?;
++        let data = STANDARD.decode(value.as_str()?).ok()?;
++        if !valid_viewport_png(&data) { return None; }
++        Some(data)
++    }
++    fn click(&self, x: i32, y: i32) -> bool { self.action("click", json!({"x":x,"y":y})) }
++    fn swipe(&self, x1: i32, y1: i32, x2: i32, y2: i32, duration: i32) -> bool {
++        self.action("swipe", json!({"x1":x1,"y1":y1,"x2":x2,"y2":y2,"duration":duration}))
++    }
++    fn touch_down(&self, contact: i32, x: i32, y: i32, pressure: i32) -> bool {
++        self.action("touch_down", json!({"contact":contact,"x":x,"y":y,"pressure":pressure}))
++    }
++    fn touch_move(&self, contact: i32, x: i32, y: i32, pressure: i32) -> bool {
++        self.action("touch_move", json!({"contact":contact,"x":x,"y":y,"pressure":pressure}))
++    }
++    fn touch_up(&self, contact: i32) -> bool { self.action("touch_up", json!({"contact":contact})) }
++    fn click_key(&self, keycode: i32) -> bool { self.action("click_key", json!({"keycode":keycode})) }
++    fn key_down(&self, keycode: i32) -> bool { self.action("key_down", json!({"keycode":keycode})) }
++    fn key_up(&self, keycode: i32) -> bool { self.action("key_up", json!({"keycode":keycode})) }
++    fn input_text(&self, text: &str) -> bool { self.action("input_text", json!({"text":text})) }
++    fn scroll(&self, dx: i32, dy: i32) -> bool { self.action("scroll", json!({"dx":dx,"dy":dy})) }
++    fn relative_move(&self, dx: i32, dy: i32) -> bool { self.action("relative_move", json!({"dx":dx,"dy":dy})) }
++    fn inactive(&self) -> bool { self.action("inactive", json!({})) }
++    fn get_info(&self) -> String {
++        json!({"type":"cloudweb", "controller_type":"CloudWeb", "backend":"QtWebEngine",
++            "input_coordinate_space":"1280x720", "pointer_lock_supported":false}).to_string()
++    }
++}
++
++/// The binding's C trampolines do not catch panics. Never unwind across FFI.
++struct GuardedCallback(CloudWebCallback);
++macro_rules! guarded_callback {
++    ($name:ident($($arg:ident : $ty:ty),*) -> $result:ty, $fallback:expr) => {
++        fn $name(&self, $($arg: $ty),*) -> $result {
++            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.0.$name($($arg),*)))
++                .unwrap_or($fallback)
++        }
++    };
++}
++impl CustomControllerCallback for GuardedCallback {
++    guarded_callback!(connect() -> bool, false);
++    guarded_callback!(connected() -> bool, false);
++    guarded_callback!(request_uuid() -> Option<String>, None);
++    guarded_callback!(screencap() -> Option<Vec<u8>>, None);
++    guarded_callback!(click(x:i32,y:i32) -> bool, false);
++    guarded_callback!(swipe(x1:i32,y1:i32,x2:i32,y2:i32,duration:i32) -> bool, false);
++    guarded_callback!(touch_down(contact:i32,x:i32,y:i32,pressure:i32) -> bool, false);
++    guarded_callback!(touch_move(contact:i32,x:i32,y:i32,pressure:i32) -> bool, false);
++    guarded_callback!(touch_up(contact:i32) -> bool, false);
++    guarded_callback!(click_key(keycode:i32) -> bool, false);
++    guarded_callback!(key_down(keycode:i32) -> bool, false);
++    guarded_callback!(key_up(keycode:i32) -> bool, false);
++    guarded_callback!(input_text(text:&str) -> bool, false);
++    guarded_callback!(scroll(dx:i32,dy:i32) -> bool, false);
++    guarded_callback!(relative_move(dx:i32,dy:i32) -> bool, false);
++    guarded_callback!(inactive() -> bool, false);
++    guarded_callback!(get_info() -> String, "{}".to_string());
++}
++
++fn valid_viewport_png(data: &[u8]) -> bool {
++    data.len() >= 33 && data.len() <= MAX_RESPONSE_BYTES
++        && &data[..8] == b"\x89PNG\r\n\x1a\n" && &data[12..16] == b"IHDR"
++        && u32::from_be_bytes([data[16],data[17],data[18],data[19]]) == 1280
++        && u32::from_be_bytes([data[20],data[21],data[22],data[23]]) == 720
++}
++
++pub fn create_controller(url: &str, session_id: &str) -> Result<(Controller, Arc<CloudWebSession>), String> {
++    #[cfg(windows)]
++    if super::system::is_elevated() && !url.is_empty() && url != "bundled-fixture" {
++        return Err("CLOUD_WEB_ELEVATED".into());
++    }
++    let root = super::utils::get_exe_directory().map_err(|_| "CLOUD_WEB_HOST_MISSING")?;
++    let name = if cfg!(windows) { "MaaEnd-CloudWeb-Prototype.exe" } else { "MaaEnd-CloudWeb-Prototype" };
++    let session = CloudWebSession::spawn(&root.join("cloudweb-host").join(name), url, session_id)?;
++    let callback = CloudWebCallback { session: Arc::downgrade(&session) };
++    let controller = Controller::new_custom(GuardedCallback(callback)).map_err(|_| "CLOUD_WEB_CREATE_FAILED")?;
++    Ok((controller, session))
++}
++
++/// Packaged, offline verification entrypoint. This deliberately uses the same
++/// Rust custom Controller factory and shipped resource bundle as the GUI.
++/// It does not load Python Maa bindings or start a second automation engine.
++pub fn run_fixture_smoke(report_path: &Path) -> Result<(), String> {
++    let root = super::utils::get_exe_directory()?;
++    let output = report_path.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
++    std::fs::create_dir_all(output).map_err(|e| e.to_string())?;
++    let result = (|| -> Result<Value, String> {
++        let lib_dir = root.join("maafw");
++        #[cfg(windows)]
++        {
++            winsafe::SetDllDirectory(Some(&lib_dir.to_string_lossy())).map_err(|e| e.to_string())?;
++        }
++        let library_name = if cfg!(windows) { "MaaFramework.dll" }
++            else if cfg!(target_os = "macos") { "libMaaFramework.dylib" }
++            else { "libMaaFramework.so" };
++        maa_framework::load_library(&lib_dir.join(library_name))?;
++        let (controller, session) = create_controller("bundled-fixture", "native-fixture-smoke")?;
++        controller.set_screenshot_target_short_side(720).map_err(|e| e.to_string())?;
++        let connection = controller.post_connection().map_err(|e| e.to_string())?;
++        wait_for_success(|| controller.status(connection), CONNECT_TIMEOUT, "connect")?;
++        if !controller.connected() { return Err("Native controller did not connect".into()); }
++
++        let resource = maa_framework::resource::Resource::new().map_err(|e| e.to_string())?;
++        let load = resource.post_bundle(&root.join("resource").to_string_lossy()).map_err(|e| e.to_string())?;
++        wait_for_success(|| load.status(), Duration::from_secs(60), "load shipped resource")?;
++        let pipeline = json!({
++            "CloudWebFixtureClick": {"recognition":"DirectHit", "action":"Click", "target":[250,360,1,1],
++                "next":["CloudWebFixtureGreen"]},
++            "CloudWebFixtureGreen": {"recognition":"ColorMatch", "method":4,
++                "roi":[20,650,20,20], "lower":[[34,197,94]], "upper":[[34,197,94]], "count":300,
++                "action":"DoNothing", "timeout":10000},
++            "CloudWebFixtureSecondClick": {"recognition":"DirectHit", "action":"Click", "target":[250,360,1,1],
++                "next":["CloudWebFixtureBlue"]},
++            "CloudWebFixtureBlue": {"recognition":"ColorMatch", "method":4,
++                "roi":[20,650,20,20], "lower":[[59,130,246]], "upper":[[59,130,246]], "count":300,
++                "action":"DoNothing", "timeout":10000},
++            "CloudWebFixtureHold": {"recognition":"DirectHit", "action":"KeyDown", "key":16,
++                "next":["CloudWebFixtureWait"]},
++            "CloudWebFixtureWait": {"recognition":"ColorMatch", "method":4,
++                "roi":[20,650,20,20], "lower":[[255,255,255]], "upper":[[255,255,255]], "count":300,
++                "action":"DoNothing", "timeout":60000}
++        });
++        resource.override_pipeline(&pipeline.to_string()).map_err(|e| e.to_string())?;
++        let tasker = maa_framework::tasker::Tasker::new().map_err(|e| e.to_string())?;
++        tasker.bind(&resource, &controller).map_err(|e| e.to_string())?;
++        if !tasker.inited() { return Err("Native Tasker was not initialized".into()); }
++
++        let first = tasker.post_task("CloudWebFixtureClick", "{}").map_err(|e| e.to_string())?;
++        wait_for_success(|| first.status(), Duration::from_secs(30), "first native Tasker click and pixel recognition")?;
++        save_native_screenshot(&controller, &output.join("native-tasker-first.png"))?;
++
++        let hold = tasker.post_task("CloudWebFixtureHold", "{}").map_err(|e| e.to_string())?;
++        let start = Instant::now();
++        while hold.status() == maa_framework::MaaStatus::PENDING && start.elapsed() < Duration::from_secs(5) {
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        let stop_id = tasker.post_stop().map_err(|e| e.to_string())?;
++        if !session.pause_and_release_input() { return Err("Held-input release failed".into()); }
++        wait_for_success(
++            || maa_framework::MaaStatus(unsafe { maa_framework::sys::MaaTaskerStatus(tasker.raw(), stop_id) }),
++            Duration::from_secs(20), "native Tasker stop",
++        )?;
++        if !controller.connected() { return Err("Stop unexpectedly destroyed the browser".into()); }
++        if !session.resume_input() { return Err("Could not resume released input".into()); }
++        let second = tasker.post_task("CloudWebFixtureSecondClick", "{}").map_err(|e| e.to_string())?;
++        wait_for_success(|| second.status(), Duration::from_secs(30), "second native Tasker click and pixel recognition")?;
++        save_native_screenshot(&controller, &output.join("native-tasker-restarted.png"))?;
++        let inactive = controller.post_inactive().map_err(|e| e.to_string())?;
++        wait_for_success(|| controller.status(inactive), ACTION_TIMEOUT, "inactive")?;
++
++        // Destroy the native engine before reaping its view. A subsequent status
++        // request must fail closed rather than consume a stale screenshot.
++        drop(first); drop(hold); drop(second); drop(tasker); drop(resource); drop(controller);
++        session.shutdown();
++        let reaped = session.child.lock().map_err(|_| "child mutex poisoned")?.is_none();
++        if !reaped { return Err("Browser child was not reaped".into()); }
++        Ok(json!({"result":"passed", "engine":"MXU Rust MaaFramework Tasker", "offline_only":true,
++            "resource":"shipped resource bundle", "native_tasker_bound":true,
++            "first_click_pixel_verified":true, "stopped_without_closing_browser":true,
++            "restarted_click_pixel_verified":true, "child_reaped":true,
++            "screenshots":["native-tasker-first.png","native-tasker-restarted.png"],
++            "cloud_game_verified":false, "pointer_lock_verified":false}))
++    })();
++    let report = match &result {
++        Ok(value) => value.clone(),
++        Err(error) => json!({"result":"failed", "engine":"MXU Rust MaaFramework Tasker", "error":error}),
++    };
++    std::fs::write(report_path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
++        .map_err(|e| e.to_string())?;
++    result.map(|_| ())
++}
++
++fn wait_for_success(mut status: impl FnMut() -> maa_framework::MaaStatus, timeout: Duration, stage: &str) -> Result<(), String> {
++    let start = Instant::now();
++    loop {
++        let current = status();
++        if current == maa_framework::MaaStatus::SUCCEEDED { return Ok(()); }
++        if current == maa_framework::MaaStatus::FAILED || current == maa_framework::MaaStatus::INVALID {
++            return Err(format!("Native CloudWeb smoke failed: {stage}"));
++        }
++        if start.elapsed() >= timeout { return Err(format!("Native CloudWeb smoke timed out: {stage}")); }
++        std::thread::sleep(Duration::from_millis(20));
++    }
++}
++
++fn save_native_screenshot(controller: &Controller, path: &Path) -> Result<(), String> {
++    let id = controller.post_screencap().map_err(|e| e.to_string())?;
++    wait_for_success(|| controller.status(id), ACTION_TIMEOUT, "screenshot")?;
++    let data = controller.cached_image().map_err(|e| e.to_string())?.to_vec()
++        .ok_or("Native screenshot buffer was empty")?;
++    if !valid_viewport_png(&data) { return Err("Native screenshot had incorrect geometry".into()); }
++    std::fs::write(path, data).map_err(|e| e.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn mock_session() -> (Arc<CloudWebSession>, mpsc::Receiver<HostRequest>) {
++        let (requests, receiver) = mpsc::sync_channel(8);
++        (Arc::new(CloudWebSession {
++            child: Mutex::new(None), requests, healthy: Arc::new(AtomicBool::new(true)),
++            ready: AtomicBool::new(true), input_enabled: AtomicBool::new(true),
++            input_gate: Mutex::new(()), request_gate: Mutex::new(()),
++            stop_epoch: AtomicU64::new(0), pending_releases: AtomicUsize::new(0),
++            next_id: AtomicU64::new(1), session_id: "test".into(),
++        }), receiver)
++    }
++
++    #[test]
++    fn concurrent_status_does_not_timeout_a_long_action() {
++        let (session, requests) = mock_session();
++        let call_session = session.clone();
++        let action = std::thread::spawn(move || call_session.action("swipe", json!({})));
++        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
++        let callback = CloudWebCallback { session: Arc::downgrade(&session) };
++        let before = Instant::now();
++        assert!(callback.connected());
++        assert!(before.elapsed() < Duration::from_millis(200));
++        assert!(session.healthy.load(Ordering::Acquire));
++        request.reply.send(Ok(HostReply { id: request.id, ok: true, result: json!(true), error: None })).unwrap();
++        assert!(action.join().unwrap());
++    }
++
++    #[test]
++    fn stop_blocks_resume_until_release_completes() {
++        let (session, requests) = mock_session();
++        let epoch = session.stop_epoch();
++        session.begin_stop();
++        assert_ne!(session.stop_epoch(), epoch);
++        assert!(!session.resume_input());
++        let releasing = session.clone();
++        let release = std::thread::spawn(move || releasing.finish_stop_release());
++        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
++        assert!(!session.resume_input());
++        request.reply.send(Ok(HostReply { id: request.id, ok: true, result: json!(true), error: None })).unwrap();
++        assert!(release.join().unwrap());
++        assert!(session.resume_input());
++    }
++
++    #[test]
++    fn stop_rejects_input_already_waiting_for_gate() {
++        let (session, requests) = mock_session();
++        let gate = session.input_gate.lock().unwrap();
++        let pending = session.clone();
++        let action = std::thread::spawn(move || pending.action("click", json!({"x":1,"y":1})));
++        session.begin_stop();
++        drop(gate);
++        assert!(!action.join().unwrap());
++        assert!(requests.try_recv().is_err());
++    }
++
++    #[test]
++    fn response_timeout_faults_session() {
++        let (session, _requests) = mock_session();
++        assert!(session.request("screencap", json!({}), Duration::from_millis(10)).is_err());
++        assert!(!session.healthy.load(Ordering::Acquire));
++    }
++
++    #[test]
++    fn url_policy_rejects_privileged_and_credential_urls() {
++        for url in ["http://example.com", "file:///tmp/test", "https://u:p@example.com", "https://example.com:123", "https://example.com/\nsecret", "https://example.com\\@other.com"] {
++            assert!(normalized_url(url).is_err(), "{url}");
++        }
++        assert_eq!(normalized_url("").unwrap(), "bundled-fixture");
++        assert!(normalized_url("https://example.com/game").is_ok());
++    }
++
++    #[test]
++    fn protocol_line_is_bounded_and_requires_newline() {
++        assert_eq!(read_bounded_line(&mut &b"{}\nremaining"[..], 3).unwrap(), b"{}\n");
++        assert!(read_bounded_line(&mut &b"1234\n"[..], 4).is_err());
++        assert!(read_bounded_line(&mut &b"{}"[..], 10).is_err());
++    }
++
++    #[test]
++    fn png_must_match_fixed_input_viewport() {
++        let mut png = vec![0; 33];
++        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
++        png[12..16].copy_from_slice(b"IHDR");
++        png[16..20].copy_from_slice(&1280u32.to_be_bytes());
++        png[20..24].copy_from_slice(&720u32.to_be_bytes());
++        assert!(valid_viewport_png(&png));
++        png[20..24].copy_from_slice(&1080u32.to_be_bytes());
++        assert!(!valid_viewport_png(&png));
++    }
++}
+diff --git a/src-tauri/src/commands/maa_agent.rs b/src-tauri/src/commands/maa_agent.rs
+index d276381..10e071d 100644
+--- a/src-tauri/src/commands/maa_agent.rs
++++ b/src-tauri/src/commands/maa_agent.rs
+@@ -532,7 +532,7 @@ pub async fn start_tasks_impl(
+     info!("agent_configs: {:?}", agent_configs);
+     info!("cwd: {}, tcp_compat_mode: {}", cwd, tcp_compat_mode);
+ 
+-    let (resource, controller, tasker) = {
++    let (resource, controller, tasker, cloud_web_run) = {
+         debug!("[start_tasks] Acquiring instances lock...");
+         let mut instances = maa_state.instances.lock().map_err(|e| e.to_string())?;
+         debug!("[start_tasks] Instances lock acquired");
+@@ -555,6 +555,15 @@ pub async fn start_tasks_impl(
+             .clone();
+         debug!("[start_tasks] Controller acquired");
+ 
++        if let Some(session) = &instance.cloud_web_session {
++            if instance.stop_in_progress && instance.tasker.as_ref().is_some_and(|t| t.running()) {
++                return Err("CLOUD_WEB_BUSY".into());
++            }
++            if !session.resume_input() { return Err("CLOUD_WEB_BUSY".into()); }
++            instance.stop_in_progress = false;
++            instance.stop_started_at = None;
++        }
++
+         // 创建或获取 tasker（若已有 tasker 但未初始化则自动丢弃并重建）
+         let needs_new_tasker = match instance.tasker.as_ref() {
+             None => true,
+@@ -613,7 +622,8 @@ pub async fn start_tasks_impl(
+         }
+ 
+         let t = instance.tasker.as_ref().unwrap().clone();
+-        (res, ctrl, t)
++        let cloud_web_run = instance.cloud_web_session.as_ref().map(|session| (session.clone(), session.stop_epoch()));
++        (res, ctrl, t, cloud_web_run)
+     };
+     debug!("[start_tasks] Resource, controller and tasker acquired, proceeding...");
+ 
+@@ -726,6 +736,14 @@ pub async fn start_tasks_impl(
+         let instance = instances
+             .get_mut(&instance_id)
+             .ok_or("Instance not found")?;
++        if let Some((session, epoch)) = &cloud_web_run {
++            if session.stop_epoch() != *epoch
++                || !instance.cloud_web_session.as_ref().is_some_and(|current| Arc::ptr_eq(current, session))
++                || instance.stop_in_progress
++            {
++                return Err("CLOUD_WEB_BUSY".into());
++            }
++        }
+         if reset_state {
+             // 首批：重置任务运行状态
+             instance.task_ids.clear();
+diff --git a/src-tauri/src/commands/maa_core.rs b/src-tauri/src/commands/maa_core.rs
+index c32d227..d3b02c9 100644
+--- a/src-tauri/src/commands/maa_core.rs
++++ b/src-tauri/src/commands/maa_core.rs
+@@ -322,24 +322,41 @@ fn update_instance_controller(
+     instance_id: &str,
+     controller: maa_framework::controller::Controller,
+     new_config: super::types::ControllerConfig,
++    cloud_web_session: Option<Arc<super::cloud_web::CloudWebSession>>,
+ ) -> Result<(), String> {
+-    let cleanup_config = {
++    let (cleanup_config, old_tasker, old_controller, old_session) = {
+         let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
+         let instance = instances.get_mut(instance_id).ok_or("Instance not found")?;
+ 
++        // Recheck after asynchronous host startup, under the replacement lock.
++        // Also covers switching FROM CloudWeb to another controller type.
++        if (instance.cloud_web_session.is_some() || cloud_web_session.is_some())
++            && instance.tasker.as_ref().is_some_and(|tasker| tasker.running())
++        {
++            return Err("CLOUD_WEB_RECONNECT_RUNNING".into());
++        }
++
+         let old_config = instance.controller_config.clone();
+-        instance.controller = Some(controller);
++        let old_tasker = instance.tasker.take();
++        let old_controller = instance.controller.replace(controller);
+         instance.controller_config = Some(new_config.clone());
+-        instance.tasker = None;
++        let old_session = std::mem::replace(&mut instance.cloud_web_session, cloud_web_session);
+ 
+-        old_config.filter(|old| {
++        let cleanup_config = old_config.filter(|old| {
+             *old != new_config
+                 && !instances
+                     .values()
+                     .any(|inst| inst.controller_config.as_ref() == Some(old))
+-        })
++        });
++        (cleanup_config, old_tasker, old_controller, old_session)
+     };
+ 
++    // Native destructors can wait for callbacks which acquire instances. Never
++    // destroy the old Tasker while holding that callback's state mutex.
++    drop(old_tasker);
++    drop(old_controller);
++    drop(old_session);
++
+     if let Some(old_cfg) = cleanup_config {
+         if let Ok(mut pool) = state.controller_pool.lock() {
+             pool.remove(&old_cfg);
+@@ -741,14 +758,14 @@ pub fn maa_create_instance(state: State<Arc<MaaState>>, instance_id: String) ->
+ pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result<(), String> {
+     info!("destroy_instance_impl called, instance_id: {}", instance_id);
+ 
+-    let cleanup_config = {
++    let (cleanup_config, removed_instance) = {
+         let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
+         let old_config = instances
+             .get(instance_id)
+             .and_then(|inst| inst.controller_config.clone());
+-        let removed = instances.remove(instance_id).is_some();
++        let removed = instances.remove(instance_id);
+ 
+-        if removed {
++        let cleanup_config = if removed.is_some() {
+             info!(
+                 "destroy_instance_impl success, instance_id: {}",
+                 instance_id
+@@ -764,8 +781,10 @@ pub fn destroy_instance_impl(state: &Arc<MaaState>, instance_id: &str) -> Result
+                 instance_id
+             );
+             None
+-        }
++        };
++        (cleanup_config, removed)
+     };
++    drop(removed_instance);
+ 
+     // ControllerPool: 清理不再被任何实例使用的条目
+     if let Some(cfg) = cleanup_config {
+@@ -806,8 +825,19 @@ pub async fn connect_controller_impl(
+     on_event: Arc<dyn Fn(&str, &str) + Send + Sync + 'static>,
+ ) -> Result<i64, String> {
+     tokio::task::spawn_blocking(move || {
++        let is_cloud_web = matches!(&config, ControllerConfig::CloudWeb { .. });
++        if is_cloud_web {
++            let instances = state_arc.instances.lock().map_err(|e| e.to_string())?;
++            let instance = instances.get(&instance_id).ok_or("Instance not found")?;
++            if instance.tasker.as_ref().is_some_and(|tasker| tasker.running()) {
++                return Err("CLOUD_WEB_RECONNECT_RUNNING".into());
++            }
++        }
+         // ControllerPool: 检查是否有可复用的已连接控制器
+-        let pooled = {
++        let pooled = if is_cloud_web {
++            // Browser sessions are per-instance, never implicitly shared by URL.
++            None
++        } else {
+             let pool = state_arc
+                 .controller_pool
+                 .lock()
+@@ -823,7 +853,7 @@ pub async fn connect_controller_impl(
+ 
+             let conn_id = next_synthetic_conn_id();
+ 
+-            update_instance_controller(&state_arc, &instance_id, pooled_ctrl, config)?;
++            update_instance_controller(&state_arc, &instance_id, pooled_ctrl, config, None)?;
+ 
+             // 发送合成回调事件，前端无感知
+             let details = format!(r#"{{"ctrl_id":{},"action":"Connect"}}"#, conn_id);
+@@ -842,12 +872,19 @@ pub async fn connect_controller_impl(
+             pool.remove(&config);
+         }
+ 
+-        info!(
+-            "ControllerPool miss: creating new controller for {:?}",
+-            config
+-        );
++        if is_cloud_web {
++            info!("Creating an instance-owned CloudWeb controller");
++        } else {
++            info!("ControllerPool miss: creating new controller for {:?}", config);
++        }
+ 
++        let mut cloud_web_session = None;
+         let controller = match &config {
++            ControllerConfig::CloudWeb { url, session_id } => {
++                let (controller, session) = super::cloud_web::create_controller(url, session_id)?;
++                cloud_web_session = Some(session);
++                controller
++            }
+             ControllerConfig::Adb {
+                 adb_path,
+                 address,
+@@ -1025,6 +1062,7 @@ pub async fn connect_controller_impl(
+             .map_err(|e| e.to_string())?;
+ 
+         let display_short_side = match &config {
++            ControllerConfig::CloudWeb { .. } => 720,
+             ControllerConfig::Adb {
+                 display_short_side, ..
+             }
+@@ -1059,7 +1097,7 @@ pub async fn connect_controller_impl(
+         let conn_id = controller.post_connection().map_err(|e| e.to_string())?;
+ 
+         // 存入 ControllerPool
+-        {
++        if !is_cloud_web {
+             let mut pool = state_arc
+                 .controller_pool
+                 .lock()
+@@ -1069,7 +1107,7 @@ pub async fn connect_controller_impl(
+ 
+         // 更新实例状态
+         debug!("Updating instance state...");
+-        update_instance_controller(&state_arc, &instance_id, controller, config)?;
++        update_instance_controller(&state_arc, &instance_id, controller, config, cloud_web_session)?;
+ 
+         Ok(conn_id)
+     })
+@@ -1374,6 +1412,15 @@ pub fn run_task_impl(
+         return Err("Tasker not initialized even after rebuild".to_string());
+     }
+ 
++    if let Some(session) = &instance.cloud_web_session {
++        if instance.stop_in_progress && tasker.running() {
++            return Err("CLOUD_WEB_BUSY".into());
++        }
++        if !session.resume_input() { return Err("CLOUD_WEB_BUSY".into()); }
++        instance.stop_in_progress = false;
++        instance.stop_started_at = None;
++    }
++
+     let job = tasker
+         .post_task(entry, pipeline_override)
+         .map_err(|e| e.to_string())?;
+@@ -1494,7 +1541,16 @@ pub fn stop_task_impl(state: &MaaState, instance_id: &str) -> Result<(), String>
+     // 遥测：用户取消，以 cancelled 结束当前运行的 Transaction（幂等，仅首次生效）
+     super::telemetry::on_run_cancelled(instance_id);
+ 
+-    tasker.post_stop().map_err(|e| e.to_string())?;
++    let cloud_web_session = instance.cloud_web_session.clone();
++    if let Some(session) = &cloud_web_session { session.begin_stop(); }
++    let stop_result = tasker.post_stop().map_err(|e| e.to_string());
++    drop(instances);
++    if let Some(session) = cloud_web_session {
++        if !session.finish_stop_release() {
++            return Err("CLOUD_WEB_RELEASE_FAILED".into());
++        }
++    }
++    stop_result?;
+     Ok(())
+ }
+ 
+diff --git a/src-tauri/src/commands/mod.rs b/src-tauri/src/commands/mod.rs
+index 1e48245..d29d601 100644
+--- a/src-tauri/src/commands/mod.rs
++++ b/src-tauri/src/commands/mod.rs
+@@ -18,6 +18,7 @@ pub mod types;
+ pub mod utils;
+ 
+ pub mod app_config;
++pub mod cloud_web;
+ pub mod download;
+ pub mod file_ops;
+ pub mod maa_agent;
+diff --git a/src-tauri/src/commands/types.rs b/src-tauri/src/commands/types.rs
+index abe9de5..45bab2e 100644
+--- a/src-tauri/src/commands/types.rs
++++ b/src-tauri/src/commands/types.rs
+@@ -5,7 +5,7 @@
+ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+ use std::path::PathBuf;
+ use std::process::Child;
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ use std::time::Instant;
+ 
+ use serde::{Deserialize, Serialize};
+@@ -72,6 +72,10 @@ pub struct GamescopeInstance {
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+ #[serde(tag = "type")]
+ pub enum ControllerConfig {
++    CloudWeb {
++        url: String,
++        session_id: String,
++    },
+     Adb {
+         adb_path: String,
+         address: String,
+@@ -234,6 +238,8 @@ pub struct InstanceRuntime {
+     pub controller: Option<Controller>,
+     /// 当前控制器的配置（用于 ControllerPool 引用管理）
+     pub controller_config: Option<ControllerConfig>,
++    /// Explicit browser-process lifetime; custom Maa callbacks retain only Weak.
++    pub cloud_web_session: Option<Arc<super::cloud_web::CloudWebSession>>,
+     pub tasker: Option<Tasker>,
+     pub agent_clients: Vec<AgentClient>,
+     pub agent_children: Vec<Child>,
+@@ -267,6 +273,9 @@ impl Drop for InstanceRuntime {
+         if let Some(controller) = self.controller.take() {
+             drop(controller);
+         }
++        if let Some(session) = self.cloud_web_session.take() {
++            session.shutdown();
++        }
+         if let Some(resource) = self.resource.take() {
+             drop(resource);
+         }
+@@ -361,6 +370,17 @@ pub struct MaaState {
+ }
+ 
+ impl MaaState {
++    /// Close/reap product-owned browser hosts on application exit.
++    pub fn cleanup_all_cloud_web_sessions(&self) {
++        if let Ok(instances) = self.instances.lock() {
++            for instance in instances.values() {
++                if let Some(session) = &instance.cloud_web_session {
++                    session.shutdown();
++                }
++            }
++        }
++    }
++
+     /// 清理所有实例的 agent 子进程
+     pub fn cleanup_all_agent_children(&self) {
+         if let Ok(mut instances) = self.instances.lock() {
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 444a547..cb85f4e 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -331,6 +331,7 @@ pub fn run() {
+                 tauri::WindowEvent::Destroyed => {
+                     if let Some(state) = window.try_state::<Arc<MaaState>>() {
+                         state.cleanup_all_agent_children();
++                        state.cleanup_all_cloud_web_sessions();
+                     }
+                 }
+                 _ => {}
+@@ -338,9 +339,12 @@ pub fn run() {
+         })
+         .build(tauri::generate_context!())
+         .expect("error while building tauri application")
+-        .run(|_app_handle, event| {
++        .run(|app_handle, event| {
+             // 退出前收尾遥测（结束 Session 与悬挂 Transaction 并 flush）
+             if matches!(event, tauri::RunEvent::Exit) {
++                if let Some(state) = app_handle.try_state::<Arc<MaaState>>() {
++                    state.cleanup_all_cloud_web_sessions();
++                }
+                 commands::telemetry::on_app_exit();
+             }
+         });
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index c3df40e..6fd6816 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -5,6 +5,16 @@
+ mod webview2;
+ 
+ fn main() {
++    // Offline package verification runs before WebView2 bootstrap, Tauri, network
++    // services and telemetry. It still uses the real native Maa Tasker.
++    let args: Vec<String> = std::env::args().collect();
++    if args.iter().any(|arg| arg == "--cloudweb-self-test") {
++        let report = args.windows(2).find(|pair| pair[0] == "--report")
++            .map(|pair| std::path::PathBuf::from(&pair[1]))
++            .unwrap_or_else(|| std::path::PathBuf::from("cloudweb-integration-report.json"));
++        let result = mxu_lib::commands::cloud_web::run_fixture_smoke(&report);
++        std::process::exit(if result.is_ok() { 0 } else { 1 });
++    }
+     let _cli = mxu_lib::commands::system::init_cli();
+ 
+     #[cfg(target_os = "windows")]
+@@ -40,35 +50,9 @@ fn main() {
+             std::process::exit(1);
+         }
+ 
+-        // 启动时自动请求管理员权限：如果当前不是管理员，则自提权重启并退出当前进程
+-        // 说明：用户在 UAC 对话框中取消时，ShellExecuteEx 会返回 Err，此时继续以普通权限启动。
+-        // 调试模式下不请求管理员权限，方便开发调试
+-        if !cfg!(debug_assertions) && !mxu_lib::commands::system::is_elevated() {
+-            let exe_path = match std::env::current_exe() {
+-                Ok(p) => p,
+-                Err(_) => {
+-                    // 获取路径失败就按普通权限继续
+-                    mxu_lib::run();
+-                    return;
+-                }
+-            };
+-
+-            use winsafe::co::{SEE_MASK, SW};
+-            use winsafe::{ShellExecuteEx, SHELLEXECUTEINFO};
+-
+-            let result = ShellExecuteEx(&SHELLEXECUTEINFO {
+-                file: &exe_path.to_string_lossy(),
+-                verb: Option::from("runas"),
+-                show: SW::SHOWNORMAL,
+-                mask: SEE_MASK::NOASYNC | SEE_MASK::FLAG_NO_UI,
+-                ..Default::default()
+-            });
+-
+-            if result.is_ok() {
+-                // 新的管理员进程已启动，退出当前普通权限进程
+-                std::process::exit(0);
+-            }
+-        }
++        // This build hosts untrusted web content in a child process. Never
++        // automatically elevate the application or its browser subprocess.
++        // Existing permission_required native-controller warnings remain in UI.
+     }
+ 
+     mxu_lib::run()
+diff --git a/src-tauri/src/mxu_actions.rs b/src-tauri/src/mxu_actions.rs
+index 384bdf5..653307e 100644
+--- a/src-tauri/src/mxu_actions.rs
++++ b/src-tauri/src/mxu_actions.rs
+@@ -41,6 +41,22 @@ fn request_tasker_stop(ctx: &maa_framework::context::Context) -> bool {
+     unsafe { maa_framework::sys::MaaTaskerPostStop(tasker_ptr) != 0 }
+ }
+ 
++/// CloudWeb controls only its embedded page. Local game-launch/kill actions
++/// from an older saved desktop task must not escape that boundary.
++fn is_cloud_web_context(ctx: &maa_framework::context::Context) -> bool {
++    let tasker = ctx.tasker_handle();
++    if tasker.is_null() { return false; }
++    let controller = unsafe { maa_framework::sys::MaaTaskerGetController(tasker) };
++    if controller.is_null() { return false; }
++    let Ok(buffer) = maa_framework::buffer::MaaStringBuffer::new() else { return false; };
++    if unsafe { maa_framework::sys::MaaControllerGetInfo(controller, buffer.as_ptr()) } == 0 {
++        return false;
++    }
++    serde_json::from_str::<serde_json::Value>(&buffer.to_string()).ok()
++        .and_then(|value| value.get("type").and_then(|v| v.as_str()).map(str::to_owned))
++        .is_some_and(|kind| kind.eq_ignore_ascii_case("cloudweb"))
++}
++
+ fn wait_with_stop_check(ctx: &maa_framework::context::Context, total_secs: u64) -> bool {
+     const STEP: std::time::Duration = std::time::Duration::from_millis(200);
+     let total = std::time::Duration::from_secs(total_secs);
+@@ -198,9 +214,13 @@ const MXU_LAUNCH_ACTION: &str = "MXU_LAUNCH_ACTION";
+ /// MXU_LAUNCH custom action 回调函数
+ /// 从 custom_action_param 中读取 program, args, wait_for_exit，启动外部程序
+ fn mxu_launch_action_fn(
+-    _ctx: &maa_framework::context::Context,
++    ctx: &maa_framework::context::Context,
+     args: &maa_framework::custom::ActionArgs,
+ ) -> bool {
++    if is_cloud_web_context(ctx) {
++        warn!("[MXU_LAUNCH] Local program launch is disabled for CloudWeb");
++        return false;
++    }
+     let param_str = args.param;
+     info!("[MXU_LAUNCH] Received param: {}", param_str);
+ 
+@@ -498,6 +518,11 @@ fn mxu_killproc_action_impl(
+         };
+     }
+ 
++    if is_cloud_web_context(ctx) {
++        warn!("[MXU_KILLPROC] Local process termination is disabled for CloudWeb");
++        return false;
++    }
++
+     let process_name = match json.get("process_name").and_then(|v| v.as_str()) {
+         Some(p) if !p.trim().is_empty() => p.to_string(),
+         _ => {
+diff --git a/src/components/ConnectionPanel.tsx b/src/components/ConnectionPanel.tsx
+index 9744492..f3146c2 100644
+--- a/src/components/ConnectionPanel.tsx
++++ b/src/components/ConnectionPanel.tsx
+@@ -6,6 +6,7 @@ import {
+   Monitor,
+   Apple,
+   Gamepad2,
++  Cloud,
+   RefreshCw,
+   Loader2,
+   Check,
+@@ -36,6 +37,12 @@ import {
+ } from '@/utils/controller';
+ import { getInterfaceLangKey } from '@/i18n';
+ import { generateId } from '@/stores/helpers';
++import {
++  buildCloudWebControllerConfig,
++  isValidCloudWebUrl,
++  getCloudWebDeviceName,
++} from '@/utils/cloudWebController';
++import { CloudWebUrlInput } from './connection/CloudWebUrlInput';
+ import {
+   startGlobalCallbackListener,
+   waitForCtrlResult,
+@@ -212,6 +219,7 @@ export function ConnectionPanel() {
+   const currentController =
+     controllers.find((c) => c.name === currentControllerName) || controllers[0];
+   const controllerType = currentController?.type;
++  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? '';
+   const isDesktopWindowController = isDesktopWindowControllerType(controllerType);
+   const { classRegex: desktopWindowClassRegex, titleRegex: desktopWindowTitleRegex } =
+     getDesktopWindowFilters(currentController);
+@@ -399,14 +407,18 @@ export function ConnectionPanel() {
+           ((savedDevice.gamescopeDisplayNo !== undefined &&
+             (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
+             (savedDevice.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
+-        (controllerType === 'PlayCover' && savedDevice.playcoverAddress));
++        (controllerType === 'PlayCover' && savedDevice.playcoverAddress) ||
++        (controllerType === 'CloudWeb' && savedDevice.cloudWebUrl !== undefined));
+ 
+     if (hasHistoricalDevice && needsDeviceSearch) {
+       // 标记该实例已尝试过自动重连
+       autoReconnectAttempted.add(instanceId);
+       // 触发搜索并自动连接（handleSearch 内部已有匹配+自动连接逻辑）
+       handleSearch();
+-    } else if (hasHistoricalDevice && controllerType === 'PlayCover') {
++    } else if (
++      hasHistoricalDevice &&
++      (controllerType === 'PlayCover' || controllerType === 'CloudWeb')
++    ) {
+       // PlayCover 不需要搜索，直接连接
+       autoReconnectAttempted.add(instanceId);
+       handleConnect();
+@@ -634,7 +646,12 @@ export function ConnectionPanel() {
+ 
+   // 连接设备
+   const handleConnect = async () => {
+-    if (!currentController) return;
++    if (!currentController || !instanceId || isConnecting || isRunning) return;
++    autoReconnectAttempted.add(instanceId);
++    if (controllerType === 'CloudWeb' && !isValidCloudWebUrl(cloudWebUrl)) {
++      setDeviceError(t('controller.cloudWebInvalidUrl'));
++      return;
++    }
+ 
+     setIsConnecting(true);
+     setDeviceError(null);
+@@ -682,6 +699,13 @@ export function ConnectionPanel() {
+         };
+         deviceName = selectedWlrootsSocket;
+         targetType = 'device';
++      } else if (controllerType === 'CloudWeb') {
++        config = buildCloudWebControllerConfig(instanceId, cloudWebUrl);
++        setInstanceSavedDevice(instanceId, {
++          ...activeInstance?.savedDevice,
++          cloudWebUrl: config.url,
++        });
++        deviceName = getCloudWebDeviceName(config.url, t('controller.cloudWebFixture'));
+       } else if (controllerType === 'PlayCover') {
+         // 保存 PlayCover 地址到实例配置
+         setInstanceSavedDevice(instanceId, { playcoverAddress });
+@@ -826,6 +850,8 @@ export function ConnectionPanel() {
+       case 'MacOS':
+       case 'PlayCover':
+         return <Apple className="w-4 h-4" />;
++      case 'CloudWeb':
++        return <Cloud className="w-4 h-4" />;
+       case 'Gamepad':
+         return <Gamepad2 className="w-4 h-4" />;
+       default:
+@@ -1395,6 +1421,7 @@ export function ConnectionPanel() {
+       return isLinuxReadyWith(selectedGamescopeInstance, selectedWlrootsSocket);
+     }
+     if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
++    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
+     return false;
+   };
+ 
+@@ -1421,6 +1448,9 @@ export function ConnectionPanel() {
+     // 获取设备显示文本（优先显示具体设备名）
+     const getDeviceStatusText = () => {
+       const savedDevice = activeInstance?.savedDevice;
++      if (controllerType === 'CloudWeb') {
++        return getCloudWebDeviceName(cloudWebUrl, t('controller.cloudWebFixture'));
++      }
+       if (savedDevice?.adbDeviceName) {
+         return truncateText(savedDevice.adbDeviceName, 6);
+       }
+@@ -1469,7 +1499,8 @@ export function ConnectionPanel() {
+           ((s.gamescopeDisplayNo !== undefined &&
+             (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
+             (s.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
+-        s.playcoverAddress
++        s.playcoverAddress ||
++        (controllerType === 'CloudWeb' && s.cloudWebUrl !== undefined)
+       );
+     };
+ 
+@@ -1668,6 +1699,71 @@ export function ConnectionPanel() {
+               </div>
+             )}
+ 
++            {controllerType === 'CloudWeb' && (
++              <div className="space-y-2">
++                <CloudWebUrlInput
++                  value={cloudWebUrl}
++                  onChange={(url) => {
++                    // Editing must never trigger the saved-device auto-connect effect.
++                    autoReconnectAttempted.add(instanceId);
++                    setDeviceError(null);
++                    setInstanceSavedDevice(instanceId, {
++                      ...activeInstance?.savedDevice,
++                      cloudWebUrl: url,
++                    });
++                  }}
++                  disabled={isConnected || isConnecting || isRunning}
++                />
++                <button
++                  onClick={
++                    isConnected
++                      ? async () => {
++                          if (isRunning || isConnecting) return;
++                          setIsConnecting(true);
++                          try {
++                            await maaService.destroyInstance(instanceId);
++                            setIsConnected(false);
++                            setInstanceConnectionStatus(instanceId, 'Disconnected');
++                            setInstanceResourceLoaded(instanceId, false);
++                            autoReconnectAttempted.add(instanceId);
++                          } catch (err) {
++                            setDeviceError(
++                              err instanceof Error ? err.message : t('controller.connectionFailed'),
++                            );
++                          } finally {
++                            setIsConnecting(false);
++                          }
++                        }
++                      : handleConnect
++                  }
++                  disabled={isConnecting || isRunning || (!isConnected && !canConnect())}
++                  className={clsx(
++                    'w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded-md border text-sm transition-colors',
++                    isConnecting || isRunning || (!isConnected && !canConnect())
++                      ? 'bg-bg-tertiary border-border opacity-50 cursor-not-allowed'
++                      : isConnected
++                        ? 'bg-bg-tertiary border-border text-text-secondary hover:bg-bg-hover'
++                        : 'bg-accent border-accent text-white hover:bg-accent-hover',
++                  )}
++                >
++                  {isConnecting ? (
++                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
++                  ) : isConnected ? (
++                    <WifiOff className="w-3.5 h-3.5" />
++                  ) : (
++                    <Wifi className="w-3.5 h-3.5" />
++                  )}
++                  {t(
++                    isConnecting
++                      ? 'controller.connecting'
++                      : isConnected
++                        ? 'controller.disconnect'
++                        : 'controller.connect',
++                  )}
++                </button>
++              </div>
++            )}
++
+             {/* PlayCover 地址输入和连接按钮 */}
+             {controllerType === 'PlayCover' && (
+               <div className="flex gap-2">
+diff --git a/src/components/DeviceSelector.tsx b/src/components/DeviceSelector.tsx
+index 2546c91..270b6fe 100644
+--- a/src/components/DeviceSelector.tsx
++++ b/src/components/DeviceSelector.tsx
+@@ -12,6 +12,7 @@ import {
+   WifiOff,
+   Apple,
+   Gamepad2,
++  Cloud,
+   Info,
+ } from 'lucide-react';
+ import clsx from 'clsx';
+@@ -24,6 +25,13 @@ import {
+   getDesktopWindowFilters,
+   isDesktopWindowControllerType,
+ } from '@/utils/controller';
++import {
++  buildCloudWebControllerConfig,
++  isValidCloudWebUrl,
++  getCloudWebDeviceName,
++} from '@/utils/cloudWebController';
++import { CloudWebUrlInput } from './connection/CloudWebUrlInput';
++import { autoReconnectAttempted } from './connection/callbackCache';
+ import { loggers } from '@/utils/logger';
+ 
+ const log = loggers.device;
+@@ -55,7 +63,11 @@ export function DeviceSelector({
+     setCachedWin32Windows,
+     setCachedWlrootsSockets,
+     registerCtrlIdName,
++    instances,
++    setInstanceSavedDevice,
+   } = useAppStore();
++  const instance = instances.find((item) => item.id === instanceId);
++  const cloudWebUrl = instance?.savedDevice?.cloudWebUrl ?? '';
+ 
+   // 选中的设备（本地状态）
+   const [selectedAdbDevice, setSelectedAdbDevice] = useState<AdbDevice | null>(null);
+@@ -256,6 +268,10 @@ export function DeviceSelector({
+           wlr_socket_path: selectedWlrootsSocket,
+           use_win32_vk_code: controllerDef.wlroots?.use_win32_vk_code ?? false,
+         };
++      } else if (controllerType === 'CloudWeb') {
++        if (!isValidCloudWebUrl(cloudWebUrl)) throw new Error(t('controller.cloudWebInvalidUrl'));
++        config = buildCloudWebControllerConfig(instanceId, cloudWebUrl);
++        setInstanceSavedDevice(instanceId, { ...instance?.savedDevice, cloudWebUrl: config.url });
+       } else if (controllerType === 'PlayCover') {
+         config = {
+           type: 'PlayCover',
+@@ -280,6 +296,8 @@ export function DeviceSelector({
+       } else if (controllerType === 'WlRoots' && selectedWlrootsSocket) {
+         deviceName = selectedWlrootsSocket;
+         targetType = 'device';
++      } else if (controllerType === 'CloudWeb') {
++        deviceName = getCloudWebDeviceName(cloudWebUrl, t('controller.cloudWebFixture'));
+       } else if (controllerType === 'PlayCover') {
+         deviceName = playcoverAddress;
+         targetType = 'device';
+@@ -482,6 +500,7 @@ export function DeviceSelector({
+     if (isDesktopWindowController) return !!selectedWindow;
+     if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
+     if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
++    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
+     return false;
+   };
+ 
+@@ -498,6 +517,8 @@ export function DeviceSelector({
+       case 'MacOS':
+       case 'PlayCover':
+         return <Apple className="w-4 h-4" />;
++      case 'CloudWeb':
++        return <Cloud className="w-4 h-4" />;
+       case 'Gamepad':
+         return <Gamepad2 className="w-4 h-4" />;
+       default:
+@@ -520,6 +541,8 @@ export function DeviceSelector({
+         return t('controller.macos');
+       case 'Gamepad':
+         return t('controller.gamepad');
++      case 'CloudWeb':
++        return t('controller.cloudWeb');
+       default:
+         return controllerType;
+     }
+@@ -539,6 +562,17 @@ export function DeviceSelector({
+         )}
+       </div>
+ 
++      {controllerType === 'CloudWeb' && (
++        <CloudWebUrlInput
++          value={cloudWebUrl}
++          onChange={(url) => {
++            autoReconnectAttempted.add(instanceId);
++            setInstanceSavedDevice(instanceId, { ...instance?.savedDevice, cloudWebUrl: url });
++          }}
++          disabled={isConnected || isConnecting || instance?.isRunning}
++        />
++      )}
++
+       {/* PlayCover 地址输入 */}
+       {controllerType === 'PlayCover' && (
+         <div className="space-y-2">
+@@ -687,10 +721,10 @@ export function DeviceSelector({
+       )}
+ 
+       {/* PlayCover 需要手动连接按钮 */}
+-      {controllerType === 'PlayCover' && !isConnected && (
++      {(controllerType === 'PlayCover' || controllerType === 'CloudWeb') && !isConnected && (
+         <button
+           onClick={handleConnect}
+-          disabled={isConnecting || !canConnect()}
++          disabled={isConnecting || !canConnect() || instance?.isRunning}
+           className={clsx(
+             'w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors',
+             isConnecting || !canConnect()
+diff --git a/src/components/Toolbar.tsx b/src/components/Toolbar.tsx
+index 644006d..66317ae 100644
+--- a/src/components/Toolbar.tsx
++++ b/src/components/Toolbar.tsx
+@@ -40,6 +40,11 @@ import {
+   getLinuxDiscoveryNeeds,
+   isDesktopWindowControllerType,
+ } from '@/utils/controller';
++import {
++  buildCloudWebControllerConfig,
++  isValidCloudWebUrl,
++  getCloudWebDeviceName,
++} from '@/utils/cloudWebController';
+ import { SchedulePanel } from './SchedulePanel';
+ import type {
+   Instance,
+@@ -433,7 +438,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+         (savedDevice.adbDeviceName ||
+           savedDevice.windowName ||
+           savedDevice.wlrSocketPath ||
+-          savedDevice.playcoverAddress),
++          savedDevice.playcoverAddress ||
++          (controller?.type === 'CloudWeb' && savedDevice.cloudWebUrl !== undefined)),
+       );
+       if (!controller) {
+         return failStart(t('errors.controllerNotFound'));
+@@ -769,7 +775,16 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+           let deviceName = '';
+           let targetType: 'device' | 'window' = 'device';
+ 
+-          if (canUseSavedDevice && savedDevice && controllerType) {
++          if (controllerType === 'CloudWeb') {
++            const url = savedDevice?.cloudWebUrl ?? '';
++            if (!isValidCloudWebUrl(url)) return failStart(t('controller.cloudWebInvalidUrl'));
++            config = buildCloudWebControllerConfig(targetId, url);
++            deviceName = getCloudWebDeviceName(config.url, t('controller.cloudWebFixture'));
++            useAppStore.getState().setInstanceSavedDevice(targetId, {
++              ...savedDevice,
++              cloudWebUrl: config.url,
++            });
++          } else if (canUseSavedDevice && savedDevice && controllerType) {
+             // 有保存的设备配置，地址优先匹配，兼容旧配置按名称匹配
+             log.info(`实例 ${targetInstance.name}: 自动连接已保存的设备...`);
+             onPhaseChange?.('searching');
+diff --git a/src/components/connection/CloudWebUrlInput.tsx b/src/components/connection/CloudWebUrlInput.tsx
+new file mode 100644
+index 0000000..ce0ad80
+--- /dev/null
++++ b/src/components/connection/CloudWebUrlInput.tsx
+@@ -0,0 +1,45 @@
++import { useId } from 'react';
++import { useTranslation } from 'react-i18next';
++import clsx from 'clsx';
++import { isValidCloudWebUrl } from '@/utils/cloudWebController';
++
++interface CloudWebUrlInputProps {
++  value: string;
++  onChange: (value: string) => void;
++  disabled?: boolean;
++}
++
++/** The CloudWeb extension lives inside the existing connection panel. */
++export function CloudWebUrlInput({ value, onChange, disabled }: CloudWebUrlInputProps) {
++  const { t } = useTranslation();
++  const id = useId();
++  const invalid = !isValidCloudWebUrl(value);
++  return (
++    <div className="flex-1 min-w-0 space-y-1.5">
++      <label htmlFor={id} className="block text-xs text-text-secondary">
++        {t('controller.cloudWebUrl')}
++      </label>
++      <input
++        id={id}
++        type="url"
++        value={value}
++        onChange={(event) => onChange(event.target.value)}
++        placeholder={t('controller.cloudWebUrlPlaceholder')}
++        disabled={disabled}
++        autoComplete="off"
++        spellCheck={false}
++        aria-invalid={invalid}
++        aria-describedby={`${id}-hint`}
++        className={clsx(
++          'w-full min-w-0 px-2.5 py-1.5 rounded-md border bg-bg-tertiary text-sm',
++          'text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent transition-colors',
++          invalid ? 'border-error' : 'border-border',
++          disabled && 'opacity-60 cursor-not-allowed',
++        )}
++      />
++      <p id={`${id}-hint`} className={clsx('text-xs', invalid ? 'text-error' : 'text-text-muted')}>
++        {t(invalid ? 'controller.cloudWebInvalidUrl' : 'controller.cloudWebHint')}
++      </p>
++    </div>
++  );
++}
+diff --git a/src/components/connection/useDeviceConnection.ts b/src/components/connection/useDeviceConnection.ts
+index bcc696b..1554dcd 100644
+--- a/src/components/connection/useDeviceConnection.ts
++++ b/src/components/connection/useDeviceConnection.ts
+@@ -9,7 +9,16 @@ import {
+   getDesktopWindowFilters,
+   isDesktopWindowControllerType,
+ } from '@/utils/controller';
+-import { startGlobalCallbackListener, waitForCtrlResult } from './callbackCache';
++import {
++  buildCloudWebControllerConfig,
++  isValidCloudWebUrl,
++  getCloudWebDeviceName,
++} from '@/utils/cloudWebController';
++import {
++  autoReconnectAttempted,
++  startGlobalCallbackListener,
++  waitForCtrlResult,
++} from './callbackCache';
+ 
+ interface UseDeviceConnectionProps {
+   instanceId: string;
+@@ -38,6 +47,11 @@ export function useDeviceConnection({
+   } = useAppStore();
+ 
+   const activeInstance = instances.find((i) => i.id === instanceId);
++  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? '';
++  const setCloudWebUrl = (url: string) => {
++    autoReconnectAttempted.add(instanceId);
++    setInstanceSavedDevice(instanceId, { ...activeInstance?.savedDevice, cloudWebUrl: url });
++  };
+ 
+   const [isSearching, setIsSearching] = useState(false);
+   const [isConnecting, setIsConnecting] = useState(false);
+@@ -382,6 +396,44 @@ export function useDeviceConnection({
+     t,
+   ]);
+ 
++  const handleConnectCloudWeb = useCallback(async () => {
++    if (isConnecting || activeInstance?.isRunning) return;
++    if (!isValidCloudWebUrl(cloudWebUrl)) {
++      setDeviceError(t('controller.cloudWebInvalidUrl'));
++      return;
++    }
++    setIsConnecting(true);
++    setDeviceError(null);
++    try {
++      await ensureMaaInitialized();
++      await maaService.createInstance(instanceId).catch(() => {});
++      const config = buildCloudWebControllerConfig(instanceId, cloudWebUrl);
++      setInstanceSavedDevice(instanceId, {
++        ...activeInstance?.savedDevice,
++        cloudWebUrl: config.url,
++      });
++      await connectControllerInternal(
++        config,
++        getCloudWebDeviceName(config.url, t('controller.cloudWebFixture')),
++        'device',
++      );
++    } catch (err) {
++      setDeviceError(err instanceof Error ? err.message : t('controller.connectionFailed'));
++      setIsConnected(false);
++      setInstanceConnectionStatus(instanceId, 'Disconnected');
++      setIsConnecting(false);
++    }
++  }, [
++    instanceId,
++    cloudWebUrl,
++    activeInstance,
++    isConnecting,
++    setInstanceSavedDevice,
++    setInstanceConnectionStatus,
++    connectControllerInternal,
++    t,
++  ]);
++
+   // 获取选中设备的显示文本
+   const getSelectedDeviceText = useCallback(() => {
+     const savedDevice = activeInstance?.savedDevice;
+@@ -413,9 +465,13 @@ export function useDeviceConnection({
+       }
+       return t('controller.selectDevice');
+     }
++    if (controllerType === 'CloudWeb')
++      return getCloudWebDeviceName(cloudWebUrl, t('controller.cloudWebFixture'));
+     return t('controller.selectDevice');
+   }, [
+     controllerType,
++    cloudWebUrl,
++    instanceId,
+     isDesktopWindowController,
+     selectedAdbDevice,
+     selectedWindow,
+@@ -430,9 +486,12 @@ export function useDeviceConnection({
+     if (isDesktopWindowController) return !!selectedWindow;
+     if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
+     if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
++    if (controllerType === 'CloudWeb') return !!instanceId && isValidCloudWebUrl(cloudWebUrl);
+     return false;
+   }, [
+     controllerType,
++    cloudWebUrl,
++    instanceId,
+     isDesktopWindowController,
+     selectedAdbDevice,
+     selectedWindow,
+@@ -450,6 +509,7 @@ export function useDeviceConnection({
+     selectedWindow,
+     showDeviceDropdown,
+     playcoverAddress,
++    cloudWebUrl,
+     cachedAdbDevices,
+     cachedWin32Windows,
+     cachedWlrootsSockets,
+@@ -464,11 +524,13 @@ export function useDeviceConnection({
+     setSelectedWindow,
+     setShowDeviceDropdown,
+     setPlaycoverAddress,
++    setCloudWebUrl,
+     // Actions
+     handleSearch,
+     handleSelectAdbDevice,
+     handleSelectWindow,
+     handleConnectPlayCover,
++    handleConnectCloudWeb,
+     getSelectedDeviceText,
+     canConnect,
+     ensureMaaInitialized,
+diff --git a/src/i18n/locales/en-US.ts b/src/i18n/locales/en-US.ts
+index 154e625..ff0ed32 100644
+--- a/src/i18n/locales/en-US.ts
++++ b/src/i18n/locales/en-US.ts
+@@ -402,6 +402,25 @@ export default {
+ 
+   // Controller
+   controller: {
++    cloudWebHostMissing:
++      'Cloud browser component is missing. Install the complete CloudWeb package',
++    cloudWebConnectionFailed:
++      'Cloud browser connection failed. Disconnect and reconnect; check the logs if it persists',
++    cloudWebTimeout: 'Cloud browser response timed out. Check the connection and retry',
++    cloudWebDisconnected: 'Cloud browser disconnected. Please reconnect',
++    cloudWebBusy: 'Stop the current task before disconnecting or reconnecting the cloud browser',
++    cloudWebReleaseFailed:
++      'Could not release cloud-game keys. Stop the task and close the cloud-game window',
++    cloudWebElevated:
++      'Close the app and restart without administrator privileges before connecting',
++    cloudWeb: 'Cloud · Endfield Web',
++    cloudWebUrl: 'Cloud game URL',
++    cloudWebUrlPlaceholder: 'HTTPS URL (empty for local test page)',
++    cloudWebHint:
++      'Enter the cloud game HTTPS entry point. Leave empty for the bundled offline test page; it does not log in or enter the real game. Each instance has its own browser session.',
++    cloudWebFixture: 'Local test page',
++    cloudWebInvalidUrl:
++      'Enter a valid HTTPS URL without embedded credentials, or leave empty for the local test page',
+     title: 'Controller',
+     selectController: 'Select Controller',
+     adb: 'Android Device',
+diff --git a/src/i18n/locales/ja-JP.ts b/src/i18n/locales/ja-JP.ts
+index 15e63a1..024d2e2 100644
+--- a/src/i18n/locales/ja-JP.ts
++++ b/src/i18n/locales/ja-JP.ts
+@@ -397,6 +397,24 @@ export default {
+ 
+   // コントローラー
+   controller: {
++    cloudWebHostMissing:
++      'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
++    cloudWebConnectionFailed:
++      'ブラウザー接続に失敗しました。切断して再接続し、続く場合はログを確認してください',
++    cloudWebTimeout: '応答がタイムアウトしました。接続を確認して再試行してください',
++    cloudWebDisconnected: 'クラウドゲームとの接続が切れました。再接続してください',
++    cloudWebBusy: '切断や再接続の前に実行中のタスクを停止してください',
++    cloudWebReleaseFailed:
++      'キーを解放できませんでした。タスクを停止し、ゲームのウィンドウを閉じてください',
++    cloudWebElevated: 'アプリを閉じ、管理者権限を使わずに再起動してから接続してください',
++    cloudWeb: 'クラウド・エンドフィールド Web版',
++    cloudWebUrl: 'クラウドゲームのURL',
++    cloudWebUrlPlaceholder: 'HTTPS URL（空欄でローカル検証）',
++    cloudWebHint:
++      'クラウドゲームの HTTPS URL を入力してください。空欄では同梱のローカル検証ページを使用し、ログインや実際のゲーム開始は行いません。設定ごとに独立したブラウザーセッションを使用します。',
++    cloudWebFixture: 'ローカル検証ページ',
++    cloudWebInvalidUrl:
++      '認証情報を含まない有効な HTTPS URL を入力するか、ローカル検証のため空欄にしてください',
+     title: 'コントローラー',
+     selectController: 'コントローラーを選択',
+     adb: 'Android デバイス',
+diff --git a/src/i18n/locales/ko-KR.ts b/src/i18n/locales/ko-KR.ts
+index c3bee79..8f75460 100644
+--- a/src/i18n/locales/ko-KR.ts
++++ b/src/i18n/locales/ko-KR.ts
+@@ -392,6 +392,22 @@ export default {
+ 
+   // 컨트롤러
+   controller: {
++    cloudWebHostMissing: '클라우드 브라우저 구성 요소가 없습니다. 전체 웹 버전 패키지를 설치하세요',
++    cloudWebConnectionFailed:
++      '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
++    cloudWebTimeout: '응답 시간이 초과되었습니다. 연결을 확인하고 다시 시도하세요',
++    cloudWebDisconnected: '클라우드 게임 연결이 끊겼습니다. 다시 연결하세요',
++    cloudWebBusy: '연결을 끊거나 다시 연결하기 전에 현재 작업을 중지하세요',
++    cloudWebReleaseFailed: '게임 키를 해제하지 못했습니다. 작업을 중지하고 게임 창을 닫으세요',
++    cloudWebElevated: '앱을 닫고 관리자 권한 없이 다시 시작한 뒤 연결하세요',
++    cloudWeb: '클라우드 · 엔드필드 웹',
++    cloudWebUrl: '클라우드 게임 URL',
++    cloudWebUrlPlaceholder: 'HTTPS URL (비우면 로컬 테스트)',
++    cloudWebHint:
++      '클라우드 게임 HTTPS 주소를 입력하세요. 비워 두면 포함된 오프라인 테스트 페이지를 사용하며 로그인하거나 실제 게임을 시작하지 않습니다. 각 설정은 독립된 브라우저 세션을 사용합니다.',
++    cloudWebFixture: '로컬 테스트 페이지',
++    cloudWebInvalidUrl:
++      '인증 정보가 없는 유효한 HTTPS URL을 입력하거나 로컬 테스트를 위해 비워 두세요',
+     title: '컨트롤러',
+     selectController: '컨트롤러 선택',
+     adb: 'Android 기기',
+diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
+index 3dca5fc..9539182 100644
+--- a/src/i18n/locales/zh-CN.ts
++++ b/src/i18n/locales/zh-CN.ts
+@@ -390,6 +390,20 @@ export default {
+ 
+   // 控制器
+   controller: {
++    cloudWebHostMissing: '云游戏浏览器组件缺失，请安装完整的网页版构建包',
++    cloudWebConnectionFailed: '云游戏控制器连接失败，请断开后重连；仍失败时请查看日志',
++    cloudWebTimeout: '云游戏响应超时，请检查连接并重试',
++    cloudWebDisconnected: '云游戏连接已断开，请重新连接',
++    cloudWebBusy: '请先停止当前任务，再断开或重新连接云游戏',
++    cloudWebReleaseFailed: '释放云游戏按键失败，请停止任务并关闭云游戏窗口',
++    cloudWebElevated: '请关闭程序，并以普通用户权限重新启动后连接云游戏',
++    cloudWeb: '云·终末地网页版',
++    cloudWebUrl: '云游戏网页地址',
++    cloudWebUrlPlaceholder: 'HTTPS 地址（留空使用本地验证页）',
++    cloudWebHint:
++      '填写云游戏的 HTTPS 入口。留空使用随包本地验证页，不会登录或进入真实游戏。每个配置使用独立浏览器会话。',
++    cloudWebFixture: '本地验证页',
++    cloudWebInvalidUrl: '请输入不含账号密码的有效 HTTPS 地址，或留空使用本地验证页',
+     title: '控制器',
+     selectController: '选择控制器',
+     adb: 'Android 设备',
+diff --git a/src/i18n/locales/zh-TW.ts b/src/i18n/locales/zh-TW.ts
+index f73ab27..60d98d7 100644
+--- a/src/i18n/locales/zh-TW.ts
++++ b/src/i18n/locales/zh-TW.ts
+@@ -386,6 +386,20 @@ export default {
+ 
+   // 控制器
+   controller: {
++    cloudWebHostMissing: '雲端遊戲瀏覽器元件遺失，請安裝完整網頁版套件',
++    cloudWebConnectionFailed: '雲端遊戲控制器連線失敗，請斷線後重連；仍失敗時請查看日誌',
++    cloudWebTimeout: '雲端遊戲回應逾時，請檢查連線後重試',
++    cloudWebDisconnected: '雲端遊戲已斷線，請重新連線',
++    cloudWebBusy: '請先停止目前任務，再斷線或重新連線雲端遊戲',
++    cloudWebReleaseFailed: '釋放雲端遊戲按鍵失敗，請停止任務並關閉雲端遊戲視窗',
++    cloudWebElevated: '請關閉程式，並以一般使用者權限重新啟動後連線',
++    cloudWeb: '雲·終末地網頁版',
++    cloudWebUrl: '雲端遊戲網址',
++    cloudWebUrlPlaceholder: 'HTTPS 網址（留空使用本機驗證頁）',
++    cloudWebHint:
++      '輸入雲端遊戲 HTTPS 入口。留空使用隨附本機驗證頁，不會登入或進入真實遊戲。每個設定使用獨立瀏覽器工作階段。',
++    cloudWebFixture: '本機驗證頁',
++    cloudWebInvalidUrl: '請輸入不含帳號密碼的有效 HTTPS 網址，或留空使用本機驗證頁',
+     title: '控制器',
+     selectController: '選擇控制器',
+     adb: 'Android 裝置',
+diff --git a/src/services/interfaceLoader.ts b/src/services/interfaceLoader.ts
+index aa3744c..eefdfe3 100644
+--- a/src/services/interfaceLoader.ts
++++ b/src/services/interfaceLoader.ts
+@@ -14,6 +14,8 @@ import { loggers } from '@/utils/logger';
+ import { parseJsonc } from '@/utils/jsonc';
+ import { isTauri } from '@/utils/paths';
+ import { setBackendPort } from '@/utils/backendApi';
++import { readLocalTextFile } from '@/services/contentResolver';
++import { applyCloudWebManifest } from '@/utils/cloudWebManifest';
+ 
+ const log = loggers.app;
+ 
+@@ -336,6 +338,35 @@ async function processImports(
+   }
+ }
+ 
++/** Optional adjacent CLIENT manifest; PI source files stay strictly PI V2. */
++async function loadCloudWebExtension(
++  pi: ProjectInterface,
++  basePath: string,
++  source: 'local' | 'api' | 'http',
++): Promise<ProjectInterface> {
++  const path = joinPath(basePath, 'mxu-cloudweb.json');
++  let content: string;
++  try {
++    if (source === 'local') content = await readLocalFile(path);
++    else if (source === 'api') content = await readLocalTextFile(path);
++    else {
++      const response = await fetch(path.startsWith('/') ? path : `/${path}`);
++      if (!response.ok || !response.headers.get('content-type')?.includes('application/json'))
++        return pi;
++      content = await response.text();
++    }
++  } catch {
++    // Optional: ordinary MXU projects have no CloudWeb manifest.
++    return pi;
++  }
++  try {
++    return applyCloudWebManifest(pi, parseJsonc<unknown>(content, path));
++  } catch (error) {
++    log.warn('Ignoring invalid CloudWeb client manifest:', error);
++    return pi;
++  }
++}
++
+ // ============================================================================
+ // 平台过滤
+ // ============================================================================
+@@ -360,7 +391,7 @@ function getPlatformFlags(os: string) {
+  * 获取指定平台不支持的控制器类型集合
+  * @param os 后端真实 OS；空串时回退到浏览器平台（dev 预览）
+  */
+-function getUnsupportedControllerTypes(os: string): Set<ControllerType> {
++export function getUnsupportedControllerTypes(os: string): Set<ControllerType> {
+   const { isWindows, isMacOS, isLinux } = getPlatformFlags(os);
+   const unsupported = new Set<ControllerType>();
+   // 非 Windows 系统不支持 Win32 和 Gamepad
+@@ -449,10 +480,11 @@ export async function autoLoadInterface(): Promise<LoadResult> {
+     const dataPath = await getDataDir();
+     log.info('dataPath (数据目录):', dataPath);
+ 
+-    const pi = await loadInterfaceFromLocal(interfacePath);
++    let pi = await loadInterfaceFromLocal(interfacePath);
+ 
+     // 处理 import 字段
+     await processImports(pi, relativeBasePath, true);
++    pi = await loadCloudWebExtension(pi, relativeBasePath, 'local');
+ 
+     // 获取后端真实 OS/架构（Tauri 环境），用于平台过滤与下游消费
+     const [backendOS, backendArch] = await Promise.all([
+@@ -539,6 +571,12 @@ export async function autoLoadInterface(): Promise<LoadResult> {
+ 
+     if (apiResult) {
+       log.info('从后端 HTTP API 加载 interface.json');
++      if (apiResult.webServerPort) setBackendPort(apiResult.webServerPort);
++      apiResult.interface = await loadCloudWebExtension(
++        apiResult.interface,
++        relativeBasePath,
++        'api',
++      );
+       // 以后端返回的 OS 为准过滤（远程浏览器 OS 可能与后端不同）
+       filterControllersByPlatform(apiResult.interface, apiResult.backendOS ?? '');
+       return {
+@@ -557,11 +595,12 @@ export async function autoLoadInterface(): Promise<LoadResult> {
+   // 回退：从 public 目录加载（纯前端开发预览模式）
+   const httpPath = `/${interfacePath}`;
+   if (await httpFileExists(httpPath)) {
+-    const pi = await loadInterfaceFromHttp(httpPath);
++    let pi = await loadInterfaceFromHttp(httpPath);
+ 
+     // 处理 import 字段
+     const httpBasePath = relativeBasePath ? `/${relativeBasePath}` : '';
+     await processImports(pi, httpBasePath, false);
++    pi = await loadCloudWebExtension(pi, httpBasePath, 'http');
+ 
+     // 过滤掉当前平台不支持的控制器（纯前端 dev 预览无后端，回退到浏览器平台）
+     filterControllersByPlatform(pi, '');
+diff --git a/src/services/maaService.ts b/src/services/maaService.ts
+index 62be25e..ffc750d 100644
+--- a/src/services/maaService.ts
++++ b/src/services/maaService.ts
+@@ -19,12 +19,15 @@ import { loggers } from '@/utils/logger';
+ import { redactSecretsInText } from '@/utils/passwordOptionValues';
+ import { isTauri } from '@/utils/paths';
+ import i18n from '@/i18n';
++import { getCloudWebErrorKey } from '@/utils/cloudWebController';
+ import { apiDelete, apiGet, apiPost, apiPut, getApiBase } from '@/utils/backendApi';
+ import * as wsService from '@/services/wsService';
+ 
+ const log = loggers.maa;
+ 
+ function localizeControllerError(error: unknown): unknown {
++  const cloudWebErrorKey = getCloudWebErrorKey(error);
++  if (cloudWebErrorKey) return new Error(i18n.t(cloudWebErrorKey));
+   const message = error instanceof Error ? error.message : String(error);
+   if (message.includes('MACOS_PERMISSIONS_REQUIRED')) {
+     return new Error(i18n.t('controller.macosPermissionsRequired'));
+@@ -298,14 +301,18 @@ export const maaService = {
+    * @param instanceId 实例 ID
+    */
+   async destroyInstance(instanceId: string): Promise<void> {
+-    log.info('销毁实例:', instanceId);
+-    if (!isTauri()) {
+-      await apiDelete(`/maa/instances/${instanceId}`);
+-      log.info('销毁实例成功 (HTTP):', instanceId);
+-      return;
++    try {
++      log.info('销毁实例:', instanceId);
++      if (!isTauri()) {
++        await apiDelete(`/maa/instances/${instanceId}`);
++        log.info('销毁实例成功 (HTTP):', instanceId);
++        return;
++      }
++      await invoke('maa_destroy_instance', { instanceId });
++      log.info('销毁实例成功:', instanceId);
++    } catch (error) {
++      throw localizeControllerError(error);
+     }
+-    await invoke('maa_destroy_instance', { instanceId });
+-    log.info('销毁实例成功:', instanceId);
+   },
+ 
+   /**
+@@ -316,7 +323,11 @@ export const maaService = {
+    */
+   async connectController(instanceId: string, config: ControllerConfig): Promise<number> {
+     log.info('连接控制器, 实例:', instanceId, '类型:', config.type);
+-    log.debug('控制器配置:', config);
++    // Cloud entry URLs may contain temporary login parameters; keep them out of logs.
++    log.debug(
++      '控制器配置:',
++      config.type === 'CloudWeb' ? { ...config, url: '[redacted]' } : config,
++    );
+ 
+     try {
+       if (!isTauri()) {
+@@ -433,31 +444,35 @@ export const maaService = {
+     pipelineOverride: string = '{}',
+     selectedTaskId?: string,
+   ): Promise<number> {
+-    log.info(
+-      '运行任务, 实例:',
+-      instanceId,
+-      ', 入口:',
+-      entry,
+-      ', pipelineOverride:',
+-      pipelineOverride,
+-    );
+-    if (!isTauri()) {
+-      const result = await apiPost<{ taskIds: number[] }>(
+-        `/maa/instances/${instanceId}/tasks/run`,
+-        [{ entry, pipeline_override: pipelineOverride, selected_task_id: selectedTaskId }],
++    try {
++      log.info(
++        '运行任务, 实例:',
++        instanceId,
++        ', 入口:',
++        entry,
++        ', pipelineOverride:',
++        pipelineOverride,
+       );
+-      const taskId = result.taskIds[0] ?? 0;
+-      log.info('任务已提交 (HTTP), taskId:', taskId);
++      if (!isTauri()) {
++        const result = await apiPost<{ taskIds: number[] }>(
++          `/maa/instances/${instanceId}/tasks/run`,
++          [{ entry, pipeline_override: pipelineOverride, selected_task_id: selectedTaskId }],
++        );
++        const taskId = result.taskIds[0] ?? 0;
++        log.info('任务已提交 (HTTP), taskId:', taskId);
++        return taskId;
++      }
++      const taskId = await invoke<number>('maa_run_task', {
++        instanceId,
++        entry,
++        pipelineOverride,
++        selectedTaskId: selectedTaskId ?? null,
++      });
++      log.info('任务已提交, taskId:', taskId);
+       return taskId;
++    } catch (error) {
++      throw localizeControllerError(error);
+     }
+-    const taskId = await invoke<number>('maa_run_task', {
+-      instanceId,
+-      entry,
+-      pipelineOverride,
+-      selectedTaskId: selectedTaskId ?? null,
+-    });
+-    log.info('任务已提交, taskId:', taskId);
+-    return taskId;
+   },
+ 
+   /**
+@@ -478,14 +493,18 @@ export const maaService = {
+    * @param instanceId 实例 ID
+    */
+   async stopTask(instanceId: string): Promise<void> {
+-    log.info('停止任务, 实例:', instanceId);
+-    if (!isTauri()) {
+-      await apiPost(`/maa/instances/${instanceId}/tasks/stop`);
+-      log.info('停止任务请求已发送 (HTTP)');
+-      return;
++    try {
++      log.info('停止任务, 实例:', instanceId);
++      if (!isTauri()) {
++        await apiPost(`/maa/instances/${instanceId}/tasks/stop`);
++        log.info('停止任务请求已发送 (HTTP)');
++        return;
++      }
++      await invoke('maa_stop_task', { instanceId });
++      log.info('停止任务请求已发送');
++    } catch (error) {
++      throw localizeControllerError(error);
+     }
+-    await invoke('maa_stop_task', { instanceId });
+-    log.info('停止任务请求已发送');
+   },
+ 
+   /**
+@@ -646,51 +665,55 @@ export const maaService = {
+     controllerInfo?: ControllerTelemetryInfo,
+     logRedactSecrets?: string[],
+   ): Promise<number[]> {
+-    log.info('启动任务, 实例:', instanceId, ', 任务数:', tasks.length, ', cwd:', cwd || '.');
+-    tasks.forEach((task, i) => {
+-      const override =
+-        logRedactSecrets && logRedactSecrets.length > 0
+-          ? redactSecretsInText(task.pipeline_override, logRedactSecrets)
+-          : task.pipeline_override;
+-      log.debug(`  任务[${i}]: entry=${task.entry}, pipelineOverride=${override}`);
+-    });
+-    if (agentConfigs && agentConfigs.length > 0) {
+-      log.info(
+-        'Agent 配置:',
+-        JSON.stringify(agentConfigs),
+-        ', 数量:',
+-        agentConfigs.length,
+-        ', tcpCompatMode:',
+-        tcpCompatMode,
+-      );
+-    }
+-    if (!isTauri()) {
+-      const result = await apiPost<{ taskIds: number[] }>(
+-        `/maa/instances/${instanceId}/tasks/start`,
+-        {
+-          tasks,
+-          agent_configs: agentConfigs && agentConfigs.length > 0 ? agentConfigs : null,
+-          cwd: cwd || null,
+-          tcp_compat_mode: tcpCompatMode || false,
+-          pi_envs: agentConfigs && agentConfigs.length > 0 && piEnvs ? piEnvs : null,
+-          controller_info: controllerInfo ?? null,
+-        },
+-      );
+-      log.info('任务已提交 (HTTP), taskIds:', result.taskIds);
+-      return result.taskIds;
++    try {
++      log.info('启动任务, 实例:', instanceId, ', 任务数:', tasks.length, ', cwd:', cwd || '.');
++      tasks.forEach((task, i) => {
++        const override =
++          logRedactSecrets && logRedactSecrets.length > 0
++            ? redactSecretsInText(task.pipeline_override, logRedactSecrets)
++            : task.pipeline_override;
++        log.debug(`  任务[${i}]: entry=${task.entry}, pipelineOverride=${override}`);
++      });
++      if (agentConfigs && agentConfigs.length > 0) {
++        log.info(
++          'Agent 配置:',
++          JSON.stringify(agentConfigs),
++          ', 数量:',
++          agentConfigs.length,
++          ', tcpCompatMode:',
++          tcpCompatMode,
++        );
++      }
++      if (!isTauri()) {
++        const result = await apiPost<{ taskIds: number[] }>(
++          `/maa/instances/${instanceId}/tasks/start`,
++          {
++            tasks,
++            agent_configs: agentConfigs && agentConfigs.length > 0 ? agentConfigs : null,
++            cwd: cwd || null,
++            tcp_compat_mode: tcpCompatMode || false,
++            pi_envs: agentConfigs && agentConfigs.length > 0 && piEnvs ? piEnvs : null,
++            controller_info: controllerInfo ?? null,
++          },
++        );
++        log.info('任务已提交 (HTTP), taskIds:', result.taskIds);
++        return result.taskIds;
++      }
++      const hasAgent = (agentConfigs?.length ?? 0) > 0;
++      const taskIds = await invoke<number[]>('maa_start_tasks', {
++        instanceId,
++        tasks,
++        agentConfigs: hasAgent ? agentConfigs : null,
++        cwd: cwd || '.',
++        tcpCompatMode: tcpCompatMode || false,
++        piEnvs: hasAgent && piEnvs ? piEnvs : null,
++        controllerInfo: controllerInfo ?? null,
++      });
++      log.info('任务已提交, taskIds:', taskIds);
++      return taskIds;
++    } catch (error) {
++      throw localizeControllerError(error);
+     }
+-    const hasAgent = (agentConfigs?.length ?? 0) > 0;
+-    const taskIds = await invoke<number[]>('maa_start_tasks', {
+-      instanceId,
+-      tasks,
+-      agentConfigs: hasAgent ? agentConfigs : null,
+-      cwd: cwd || '.',
+-      tcpCompatMode: tcpCompatMode || false,
+-      piEnvs: hasAgent && piEnvs ? piEnvs : null,
+-      controllerInfo: controllerInfo ?? null,
+-    });
+-    log.info('任务已提交, taskIds:', taskIds);
+-    return taskIds;
+   },
+ 
+   /**
+diff --git a/src/types/config.ts b/src/types/config.ts
+index 0931274..6682549 100644
+--- a/src/types/config.ts
++++ b/src/types/config.ts
+@@ -41,6 +41,8 @@ export interface SavedDeviceInfo {
+   wlrSocketPath?: string;
+   // PlayCover：保存地址
+   playcoverAddress?: string;
++  /** CloudWeb: empty URL selects the bundled offline verification page. */
++  cloudWebUrl?: string;
+   /** Win32 连接窗口对应的进程可执行文件路径 */
+   connectedProgramPath?: string;
+ }
+diff --git a/src/types/interface.ts b/src/types/interface.ts
+index 0dcc16f..d716408 100644
+--- a/src/types/interface.ts
++++ b/src/types/interface.ts
+@@ -1,4 +1,4 @@
+-// MaaFramework ProjectInterface V2 协议类型定义
++// MaaFramework ProjectInterface V2 runtime model. Client-only extensions are marked explicitly.
+ 
+ export interface ProjectInterface {
+   interface_version: 2;
+@@ -136,7 +136,7 @@ export function normalizeAgentConfigs(
+   return Array.isArray(agent) ? agent : [agent];
+ }
+ 
+-export type ControllerType =
++export type PiControllerType =
+   | 'Adb'
+   | 'Win32'
+   | 'MacOS'
+@@ -145,6 +145,9 @@ export type ControllerType =
+   | 'PlayCover'
+   | 'Gamepad';
+ 
++/** In-memory client extension only; CloudWeb must never be emitted into PI interface.json. */
++export type ControllerType = PiControllerType | 'CloudWeb';
++
+ export interface ControllerItem {
+   name: string;
+   label?: string;
+@@ -386,6 +389,8 @@ export interface SavedDeviceInfo {
+   windowName?: string;
+   wlrSocketPath?: string;
+   playcoverAddress?: string;
++  /** CloudWeb: empty URL selects the bundled offline verification page. */
++  cloudWebUrl?: string;
+   /** Linux 控制器：gamescope display 号（gamescope-<n> 的 n，节点 id 会随会话变化，故存 display 号） */
+   gamescopeDisplayNo?: number;
+   /** Linux 控制器：uinput 输入的物理屏幕分辨率（宽/高） */
+diff --git a/src/types/maa.ts b/src/types/maa.ts
+index b5e23cd..f4111b3 100644
+--- a/src/types/maa.ts
++++ b/src/types/maa.ts
+@@ -95,6 +95,15 @@ export interface GamepadControllerConfig {
+   display_short_side?: number;
+ }
+ 
++/** Isolated MXU CloudWeb extension backed by the bundled browser controller. */
++export interface CloudWebControllerConfig {
++  type: 'CloudWeb';
++  /** HTTPS entry point, or empty string for the bundled verification page. */
++  url: string;
++  /** Derived from the MXU instance ID; never shared between independent instances. */
++  session_id: string;
++}
++
+ /** 控制器配置 */
+ export type ControllerConfig =
+   | AdbControllerConfig
+@@ -103,7 +112,8 @@ export type ControllerConfig =
+   | WlRootsControllerConfig
+   | LinuxControllerConfig
+   | PlayCoverControllerConfig
+-  | GamepadControllerConfig;
++  | GamepadControllerConfig
++  | CloudWebControllerConfig;
+ 
+ /** 连接状态 */
+ export type ConnectionStatus = 'Disconnected' | 'Connecting' | 'Connected' | { Failed: string };
+diff --git a/src/utils/cloudWebController.ts b/src/utils/cloudWebController.ts
+new file mode 100644
+index 0000000..cc99d45
+--- /dev/null
++++ b/src/utils/cloudWebController.ts
+@@ -0,0 +1,61 @@
++import type { CloudWebControllerConfig } from '@/types/maa';
++
++/** Empty is intentional: the backend loads its bundled, offline verification page. */
++export function isValidCloudWebUrl(value: unknown): value is string {
++  if (typeof value !== 'string') return false;
++  const url = value.trim();
++  if (!url) return true;
++  // Match the native host contract: bounded ASCII HTTPS, default TLS port only.
++  if (url.length > 4096 || /[^\x21-\x7e]/.test(url) || url.includes('\\')) return false;
++  try {
++    const parsed = new URL(url);
++    return (
++      parsed.protocol === 'https:' &&
++      !!parsed.hostname &&
++      !parsed.username &&
++      !parsed.password &&
++      (!parsed.port || parsed.port === '443')
++    );
++  } catch {
++    return false;
++  }
++}
++
++/** One builder for manual connection and toolbar/scheduled-start reconnects. */
++export function buildCloudWebControllerConfig(
++  instanceId: string,
++  url = '',
++): CloudWebControllerConfig {
++  if (!isValidCloudWebUrl(url)) throw new Error('CLOUD_WEB_INVALID_URL');
++  if (!/^[a-zA-Z0-9_:-]{1,128}$/.test(instanceId)) throw new Error('CLOUD_WEB_INVALID_SESSION');
++  return { type: 'CloudWeb', url: url.trim(), session_id: instanceId };
++}
++
++/** Never put URL query strings, fragments or login data into connection logs. */
++export function getCloudWebDeviceName(url: string | undefined, fixtureLabel: string): string {
++  if (typeof url !== 'string' || !url.trim() || !isValidCloudWebUrl(url)) return fixtureLabel;
++  return new URL(url.trim()).host;
++}
++
++/** Bridge codes are intentionally data-free and localized at the service boundary. */
++export function getCloudWebErrorKey(error: unknown): string | undefined {
++  const message = error instanceof Error ? error.message : String(error);
++  const code = message.match(/\bCLOUD_WEB_[A-Z_]+\b/)?.[0];
++  if (!code) return undefined;
++  const keys: Record<string, string> = {
++    CLOUD_WEB_INVALID_URL: 'cloudWebInvalidUrl',
++    CLOUD_WEB_INVALID_SESSION: 'cloudWebConnectionFailed',
++    CLOUD_WEB_HOST_MISSING: 'cloudWebHostMissing',
++    CLOUD_WEB_START_FAILED: 'cloudWebConnectionFailed',
++    CLOUD_WEB_PROTOCOL_ERROR: 'cloudWebConnectionFailed',
++    CLOUD_WEB_TIMEOUT: 'cloudWebTimeout',
++    CLOUD_WEB_DISCONNECTED: 'cloudWebDisconnected',
++    CLOUD_WEB_BUSY: 'cloudWebBusy',
++    CLOUD_WEB_REJECTED: 'cloudWebConnectionFailed',
++    CLOUD_WEB_RECONNECT_RUNNING: 'cloudWebBusy',
++    CLOUD_WEB_RELEASE_FAILED: 'cloudWebReleaseFailed',
++    CLOUD_WEB_ELEVATED: 'cloudWebElevated',
++    CLOUD_WEB_CREATE_FAILED: 'cloudWebConnectionFailed',
++  };
++  return `controller.${keys[code] || 'cloudWebConnectionFailed'}`;
++}
+diff --git a/src/utils/cloudWebManifest.ts b/src/utils/cloudWebManifest.ts
+new file mode 100644
+index 0000000..5efa364
+--- /dev/null
++++ b/src/utils/cloudWebManifest.ts
+@@ -0,0 +1,101 @@
++import type { ProjectInterface } from '@/types/interface';
++
++/** Client-only extension. This is never read from or written into PI interface.json. */
++export interface CloudWebManifest {
++  schema_version: 1;
++  controller: { name: 'CloudWeb'; label: string };
++  compatible_tasks: string[];
++  compatible_options?: string[];
++}
++
++function hasOnlyKeys(value: Record<string, unknown>, keys: string[]): boolean {
++  return Object.keys(value).every((key) => keys.includes(key));
++}
++
++export function parseCloudWebManifest(value: unknown): CloudWebManifest {
++  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
++    throw new Error('CLOUD_WEB_INVALID_MANIFEST');
++  }
++  const manifest = value as Record<string, unknown>;
++  const controller = manifest.controller as Record<string, unknown> | null;
++  if (
++    !hasOnlyKeys(manifest, [
++      'schema_version',
++      'controller',
++      'compatible_tasks',
++      'compatible_options',
++    ]) ||
++    manifest.schema_version !== 1 ||
++    !controller ||
++    typeof controller !== 'object' ||
++    Array.isArray(controller) ||
++    !hasOnlyKeys(controller, ['name', 'label']) ||
++    controller.name !== 'CloudWeb' ||
++    typeof controller.label !== 'string' ||
++    !controller.label.trim() ||
++    controller.label.length > 256 ||
++    !Array.isArray(manifest.compatible_tasks) ||
++    !manifest.compatible_tasks.every((name) => typeof name === 'string' && !!name.trim()) ||
++    new Set(manifest.compatible_tasks).size !== manifest.compatible_tasks.length ||
++    (manifest.compatible_options !== undefined &&
++      (!Array.isArray(manifest.compatible_options) ||
++        !manifest.compatible_options.every((name) => typeof name === 'string' && !!name.trim()) ||
++        new Set(manifest.compatible_options).size !== manifest.compatible_options.length))
++  )
++    throw new Error('CLOUD_WEB_INVALID_MANIFEST');
++  return {
++    schema_version: 1,
++    controller: { name: 'CloudWeb', label: controller.label },
++    compatible_tasks: [...manifest.compatible_tasks] as string[],
++    ...(manifest.compatible_options
++      ? { compatible_options: [...(manifest.compatible_options as string[])] }
++      : {}),
++  };
++}
++
++/** Return a runtime copy. The original PI and imported task declarations remain unchanged. */
++export function applyCloudWebManifest(pi: ProjectInterface, value: unknown): ProjectInterface {
++  const manifest = parseCloudWebManifest(value);
++  if (pi.controller.some((controller) => controller.name === 'CloudWeb')) {
++    throw new Error('CLOUD_WEB_CONTROLLER_NAME_CONFLICT');
++  }
++  const allowed = new Set(manifest.compatible_tasks);
++  const taskNames = new Set(pi.task.map((task) => task.name));
++  if (manifest.compatible_tasks.some((name) => !taskNames.has(name))) {
++    throw new Error('CLOUD_WEB_UNKNOWN_COMPATIBLE_TASK');
++  }
++  const originalControllerNames = pi.controller.map((controller) => controller.name);
++  const allowedOptions = new Set(manifest.compatible_options ?? []);
++  if ([...allowedOptions].some((name) => !pi.option?.[name])) {
++    throw new Error('CLOUD_WEB_UNKNOWN_COMPATIBLE_OPTION');
++  }
++  return {
++    ...pi,
++    controller: [...pi.controller, { ...manifest.controller, type: 'CloudWeb' }],
++    option: pi.option
++      ? Object.fromEntries(
++          Object.entries(pi.option).map(([name, option]) => [
++            name,
++            allowedOptions.has(name)
++              ? {
++                  ...option,
++                  controller: [
++                    ...(option.controller?.length ? option.controller : originalControllerNames),
++                    'CloudWeb',
++                  ],
++                }
++              : option,
++          ]),
++        )
++      : undefined,
++    task: pi.task.map((task) => {
++      // Unrestricted existing tasks remain available to the original controllers only,
++      // unless explicitly allowlisted for the new browser backend.
++      const controllers = task.controller?.length ? task.controller : originalControllerNames;
++      return {
++        ...task,
++        controller: allowed.has(task.name) ? [...controllers, 'CloudWeb'] : [...controllers],
++      };
++    }),
++  };
++}
+diff --git a/src/utils/controller.ts b/src/utils/controller.ts
+index 27af5f1..7a7692b 100644
+--- a/src/utils/controller.ts
++++ b/src/utils/controller.ts
+@@ -120,6 +120,7 @@ const WORKSTATION_UNLOCK_REQUIREMENT: Record<ControllerType, boolean> = {
+   Linux: false,
+   PlayCover: false,
+   Gamepad: true,
++  CloudWeb: false,
+ };
+ 
+ /** Whether the controller depends on the interactive Windows desktop. */
+diff --git a/src/utils/useMaaCallbackLogger.ts b/src/utils/useMaaCallbackLogger.ts
+index 7a063a3..2ca19ab 100644
+--- a/src/utils/useMaaCallbackLogger.ts
++++ b/src/utils/useMaaCallbackLogger.ts
+@@ -1,3 +1,4 @@
++import { getCloudWebDeviceName } from '@/utils/cloudWebController';
+ /**
+  * MAA 回调日志监听 hook
+  * 监听 maa-callback 事件并将相关信息添加到日志面板
+@@ -197,6 +198,11 @@ function inferCtrlInfoFromInstance(
+       labels,
+     );
+     return { type: 'device', name };
++  } else if (controller.type === 'CloudWeb') {
++    return {
++      type: 'device',
++      name: getCloudWebDeviceName(savedDevice?.cloudWebUrl, controller.label || controller.name),
++    };
+   } else if (controller.type === 'PlayCover') {
+     return { type: 'device', name: savedDevice?.playcoverAddress };
+   }
+diff --git a/tests/cloudWebController.test.ts b/tests/cloudWebController.test.ts
+new file mode 100644
+index 0000000..80932e4
+--- /dev/null
++++ b/tests/cloudWebController.test.ts
+@@ -0,0 +1,79 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  buildCloudWebControllerConfig,
++  getCloudWebDeviceName,
++  getCloudWebErrorKey,
++  isValidCloudWebUrl,
++} from '../src/utils/cloudWebController.ts';
++
++test('CloudWeb default is the offline fixture, with a stable per-instance session', () => {
++  assert.deepEqual(buildCloudWebControllerConfig('instance-a'), {
++    type: 'CloudWeb',
++    url: '',
++    session_id: 'instance-a',
++  });
++  assert.deepEqual(
++    buildCloudWebControllerConfig('instance-a', '  '),
++    buildCloudWebControllerConfig('instance-a'),
++  );
++  assert.notEqual(
++    buildCloudWebControllerConfig('instance-a').session_id,
++    buildCloudWebControllerConfig('instance-b').session_id,
++  );
++  assert.throws(() => buildCloudWebControllerConfig(''), /INVALID_SESSION/);
++  assert.throws(() => buildCloudWebControllerConfig('../shared'), /INVALID_SESSION/);
++});
++
++test('CloudWeb accepts HTTPS public query parameters and trims outer spaces', () => {
++  for (const url of ['', 'https://example.com', 'https://example.com:443/game?region=cn#play']) {
++    assert.equal(isValidCloudWebUrl(url), true, url);
++  }
++  assert.equal(
++    buildCloudWebControllerConfig('instance-a', ' https://example.com/game ').url,
++    'https://example.com/game',
++  );
++});
++
++test('CloudWeb rejects invalid/non-TLS/credential-bearing and out-of-contract URLs', () => {
++  for (const url of [
++    null,
++    123,
++    'http://example.com',
++    'file:///tmp/test',
++    'javascript:alert(1)',
++    'https://user:pass@example.com',
++    'https://example.com:8443',
++    'https://exam ple.com',
++    'https://example.com/\ntest',
++    'https://例子.com',
++    'https://example.com/\\bad',
++    'https://example.com/' + 'a'.repeat(4096),
++  ]) {
++    assert.equal(isValidCloudWebUrl(url), false, String(url));
++  }
++  assert.throws(
++    () => buildCloudWebControllerConfig('instance-a', 'http://example.com'),
++    /INVALID_URL/,
++  );
++});
++
++test('CloudWeb device logs never include query or fragment login parameters', () => {
++  assert.equal(
++    getCloudWebDeviceName('https://example.com/play?token=secret#secret', 'fixture'),
++    'example.com',
++  );
++  assert.equal(getCloudWebDeviceName('', 'fixture'), 'fixture');
++  assert.equal(getCloudWebDeviceName(undefined, 'fixture'), 'fixture');
++});
++
++test('CloudWeb bridge errors are localized without echoing response data', () => {
++  assert.equal(
++    getCloudWebErrorKey(new Error('API failed: {"error":"CLOUD_WEB_HOST_MISSING"}')),
++    'controller.cloudWebHostMissing',
++  );
++  assert.equal(getCloudWebErrorKey('CLOUD_WEB_RECONNECT_RUNNING'), 'controller.cloudWebBusy');
++  assert.equal(getCloudWebErrorKey('CLOUD_WEB_RELEASE_FAILED'), 'controller.cloudWebReleaseFailed');
++  assert.equal(getCloudWebErrorKey('CLOUD_WEB_ELEVATED'), 'controller.cloudWebElevated');
++  assert.equal(getCloudWebErrorKey('unrelated error'), undefined);
++});
+diff --git a/tests/cloudWebIntegration.test.ts b/tests/cloudWebIntegration.test.ts
+new file mode 100644
+index 0000000..3067fef
+--- /dev/null
++++ b/tests/cloudWebIntegration.test.ts
+@@ -0,0 +1,148 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { fileURLToPath } from 'node:url';
++import { createServer } from 'vite';
++import { createElement } from 'react';
++import { renderToStaticMarkup } from 'react-dom/server';
++
++/** Use Vite's existing TS/alias pipeline; no extra test framework or browser dependency. */
++test('CloudWeb integrates with the existing panel, platform filters and config lifecycle', async (t) => {
++  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
++  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
++  const storage = new Map<string, string>([['mxu-language', 'zh-CN']]);
++  Object.defineProperty(globalThis, 'localStorage', {
++    configurable: true,
++    value: {
++      getItem: (key: string) => storage.get(key) ?? null,
++      setItem: (key: string, value: string) => storage.set(key, value),
++      removeItem: (key: string) => storage.delete(key),
++    },
++  });
++  const root = fileURLToPath(new URL('../', import.meta.url));
++  const server = await createServer({
++    root,
++    configFile: false,
++    logLevel: 'silent',
++    optimizeDeps: { noDiscovery: true, include: [] },
++    resolve: { alias: { '@': `${root}src` } },
++    server: { middlewareMode: true, watch: null },
++  });
++  try {
++    const { useAppStore, flushConfig } = await server.ssrLoadModule('/src/stores/appStore.ts');
++    const { getUnsupportedControllerTypes } = await server.ssrLoadModule(
++      '/src/services/interfaceLoader.ts',
++    );
++    const { requiresUnlockedWorkstation } = await server.ssrLoadModule('/src/utils/controller.ts');
++    const { buildCloudWebControllerConfig } = await server.ssrLoadModule(
++      '/src/utils/cloudWebController.ts',
++    );
++    const { buildTabConfigExportText, importTabConfigFromText } = await server.ssrLoadModule(
++      '/src/utils/tabExportImport.ts',
++    );
++    const { ConnectionPanel } = await server.ssrLoadModule('/src/components/ConnectionPanel.tsx');
++    const instance = {
++      id: 'cloudweb-a',
++      name: 'CloudWeb A',
++      controllerName: 'CloudWeb',
++      resourceName: 'Base',
++      savedDevice: { cloudWebUrl: 'https://example.com/play?region=cn#private' },
++      selectedTasks: [],
++      isRunning: false,
++    };
++    useAppStore.setState({
++      projectInterface: {
++        name: 'MaaEnd',
++        controller: [
++          { name: 'Win32', label: '桌面端', type: 'Win32' },
++          { name: 'CloudWeb', label: '云·终末地网页版', type: 'CloudWeb' },
++        ],
++        resource: [{ name: 'Base', path: ['resource'] }],
++        task: [],
++      },
++      instances: [instance],
++      activeInstanceId: instance.id,
++      selectedController: { [instance.id]: 'CloudWeb' },
++      selectedResource: { [instance.id]: 'Base' },
++      language: 'zh-CN',
++      connectionPanelExpanded: true,
++      configPersistenceReady: false,
++    });
++
++    await t.test('CloudWeb remains supported on Windows, macOS and Linux', () => {
++      for (const os of ['windows', 'macos', 'linux']) {
++        assert.equal(getUnsupportedControllerTypes(os).has('CloudWeb'), false, os);
++      }
++      assert.equal(requiresUnlockedWorkstation('CloudWeb'), false);
++    });
++
++    await t.test('existing connection panel renders CloudWeb chip and accessible URL input', () => {
++      // Zustand SSR intentionally reads its initial snapshot; supply our test fixture snapshot.
++      Object.assign(useAppStore.getInitialState(), useAppStore.getState());
++      const html = renderToStaticMarkup(createElement(ConnectionPanel));
++      assert.match(html, /id="connection-panel"/);
++      assert.match(html, /云·终末地网页版/);
++      assert.match(html, /云游戏网页地址/);
++      assert.match(html, /type="url"/);
++      assert.match(html, /value="https:\/\/example.com\/play\?region=cn#private"/);
++      assert.match(html, /留空使用/);
++      assert.doesNotMatch(html, /prototype/i);
++    });
++
++    await t.test(
++      'full configuration round-trip preserves URL, not a persisted session token',
++      () => {
++        useAppStore.setState({ configPersistenceReady: true });
++        const config = flushConfig();
++        useAppStore.setState({ configPersistenceReady: false });
++        assert.equal(config.instances[0].savedDevice.cloudWebUrl, instance.savedDevice.cloudWebUrl);
++        assert.equal('session_id' in config.instances[0].savedDevice, false);
++        Object.defineProperty(globalThis, 'document', {
++          configurable: true,
++          value: {
++            documentElement: {
++              style: { setProperty() {} },
++              classList: { toggle() {} },
++              setAttribute() {},
++            },
++          },
++        });
++
++        config.settings.helpImproveSoftware = false;
++        useAppStore.getState().importConfig(JSON.parse(JSON.stringify(config)));
++        const restored = useAppStore.getState().instances[0];
++        assert.equal(restored.savedDevice.cloudWebUrl, instance.savedDevice.cloudWebUrl);
++        assert.equal(
++          buildCloudWebControllerConfig(restored.id, restored.savedDevice.cloudWebUrl).session_id,
++          instance.id,
++        );
++        // Closed/reopened configurations get a new instance ID and therefore an isolated session.
++        useAppStore.getState().removeInstance(instance.id);
++        const reopenedId = useAppStore.getState().reopenRecentlyClosed(instance.id);
++        const reopened = useAppStore.getState().instances.find((item) => item.id === reopenedId);
++        assert.equal(reopened.savedDevice.cloudWebUrl, instance.savedDevice.cloudWebUrl);
++        assert.notEqual(
++          buildCloudWebControllerConfig(reopened.id, reopened.savedDevice.cloudWebUrl).session_id,
++          instance.id,
++        );
++      },
++    );
++
++    await t.test(
++      'tab-sharing preserves controller choice without sharing device URLs or sessions',
++      async () => {
++        const text = await buildTabConfigExportText(instance, 'MaaEnd');
++        const imported = await importTabConfigFromText('MaaEnd', text);
++        assert.equal(imported.payload.controllerName, 'CloudWeb');
++        assert.equal('savedDevice' in imported.payload, false);
++        assert.equal('session_id' in imported.payload, false);
++        assert.doesNotMatch(JSON.stringify(imported.payload), /example\.com|private/);
++      },
++    );
++  } finally {
++    await server.close();
++    if (previousStorage) Object.defineProperty(globalThis, 'localStorage', previousStorage);
++    else Reflect.deleteProperty(globalThis, 'localStorage');
++    if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
++    else Reflect.deleteProperty(globalThis, 'document');
++  }
++});
+diff --git a/tests/cloudWebManifest.test.ts b/tests/cloudWebManifest.test.ts
+new file mode 100644
+index 0000000..41a69b9
+--- /dev/null
++++ b/tests/cloudWebManifest.test.ts
+@@ -0,0 +1,77 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { applyCloudWebManifest, parseCloudWebManifest } from '../src/utils/cloudWebManifest.ts';
++import type { ProjectInterface } from '../src/types/interface.ts';
++
++const source: ProjectInterface = {
++  interface_version: 2,
++  name: 'MaaEnd',
++  controller: [{ name: 'Win32-Front', type: 'Win32' }],
++  resource: [{ name: 'Base', path: ['resource'] }],
++  option: {
++    AutoCollectMode: { type: 'select', controller: ['Win32-Front'], cases: [{ name: 'all' }] },
++    NativeOnly: { type: 'select', controller: ['Win32-Front'], cases: [{ name: 'native' }] },
++  },
++  task: [
++    { name: 'allowed', entry: 'Start', controller: ['Win32-Front'] },
++    { name: 'unsupported', entry: 'NativeOnly' },
++  ],
++};
++const manifest = {
++  schema_version: 1,
++  controller: { name: 'CloudWeb', label: '云·终末地网页版' },
++  compatible_tasks: ['allowed'],
++  compatible_options: ['AutoCollectMode'],
++};
++
++test('client manifest adds runtime controller and only allowlisted task compatibility', () => {
++  const original = JSON.parse(JSON.stringify(source));
++  const runtime = applyCloudWebManifest(source, manifest);
++  assert.deepEqual(source, original);
++  assert.deepEqual(runtime.controller[1], {
++    name: 'CloudWeb',
++    label: '云·终末地网页版',
++    type: 'CloudWeb',
++  });
++  assert.deepEqual(runtime.task[0].controller, ['Win32-Front', 'CloudWeb']);
++  assert.deepEqual(runtime.task[1].controller, ['Win32-Front']);
++  assert.notEqual(runtime.task[0], source.task[0]);
++  assert.deepEqual(runtime.option?.AutoCollectMode.controller, ['Win32-Front', 'CloudWeb']);
++  assert.deepEqual(runtime.option?.NativeOnly.controller, ['Win32-Front']);
++  assert.notEqual(runtime.option?.AutoCollectMode, source.option?.AutoCollectMode);
++});
++
++test('client manifest rejects unexpected fields, PI type masquerading and stale allowlists', () => {
++  for (const value of [
++    null,
++    [],
++    {},
++    { ...manifest, schema_version: 2 },
++    { ...manifest, executable: 'injected.exe' },
++    { ...manifest, controller: { ...manifest.controller, type: 'Win32' } },
++    { ...manifest, compatible_tasks: ['allowed', 'allowed'] },
++    { ...manifest, compatible_options: ['AutoCollectMode', 'AutoCollectMode'] },
++    { ...manifest, compatible_options: ['AutoCollectMode', 12] },
++  ]) {
++    assert.throws(() => parseCloudWebManifest(value), /INVALID_MANIFEST/);
++  }
++  assert.throws(
++    () => applyCloudWebManifest(source, { ...manifest, compatible_tasks: ['missing'] }),
++    /UNKNOWN_COMPATIBLE_TASK/,
++  );
++  assert.throws(
++    () =>
++      applyCloudWebManifest(
++        { ...source, controller: [{ name: 'CloudWeb', type: 'Win32' }] },
++        manifest,
++      ),
++    /NAME_CONFLICT/,
++  );
++});
++
++test('client manifest rejects unknown option names', () => {
++  assert.throws(
++    () => applyCloudWebManifest(source, { ...manifest, compatible_options: ['missing'] }),
++    /UNKNOWN_COMPATIBLE_OPTION/,
++  );
++});

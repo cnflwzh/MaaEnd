@@ -18,6 +18,8 @@ const (
 	CONTROL_TYPE_MACOS = "macos"
 	CONTROL_TYPE_LINUX = "linux"
 	CONTROL_TYPE_ADB   = "adb"
+	// CloudWeb uses view-local desktop input, never operating-system window APIs.
+	CONTROL_TYPE_CLOUD_WEB = "cloudweb"
 )
 
 // controlTypeNativeAndroid 是 MaaFramework Android 原生控制器（MaaFwApp 在手机上直接跑）上报的类型。
@@ -43,6 +45,8 @@ func controlTypeFromPIType(controllerType string) string {
 		return CONTROL_TYPE_MACOS
 	case CONTROL_TYPE_LINUX:
 		return CONTROL_TYPE_LINUX
+	case CONTROL_TYPE_CLOUD_WEB:
+		return CONTROL_TYPE_CLOUD_WEB
 	default:
 		return ""
 	}
@@ -96,6 +100,9 @@ func controlTypeFromInfo(infoStr string) (string, error) {
 		return "", fmt.Errorf("controller type is empty in parsed info")
 	}
 
+	if strings.EqualFold(info.Type, CONTROL_TYPE_CLOUD_WEB) {
+		return CONTROL_TYPE_CLOUD_WEB, nil
+	}
 	if info.Type == CONTROL_TYPE_WIN32 {
 		return CONTROL_TYPE_WIN32, nil
 	}

@@ -1,8 +1,14 @@
-"""Native connection selector for the independent experiment, not MXU."""
+"""Packaged entry point: MXU-owned private host or legacy diagnostic runner."""
 
 import argparse
 from pathlib import Path
 import sys
+
+# MXU starts this same packaged executable. Dispatch before importing Qt so
+# the child can reserve stdout exclusively for its private JSON-line protocol.
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--mxu-host":
+    from mxu_host import main as mxu_main
+    raise SystemExit(mxu_main(sys.argv[2:]))
 
 from PySide6.QtCore import QProcess, QTimer
 from PySide6.QtWidgets import QApplication, QComboBox, QFormLayout, QLabel, QLineEdit, QPushButton, QWidget
@@ -78,6 +84,9 @@ class Launcher(QWidget):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--mxu-host":
+        from mxu_host import main as mxu_main
+        return mxu_main(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
         del sys.argv[1]
         from qt_main import main as worker_main
