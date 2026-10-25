@@ -1,9 +1,9 @@
 diff --git a/src-tauri/src/commands/cloud_web.rs b/src-tauri/src/commands/cloud_web.rs
 new file mode 100644
-index 0000000..b42b149
+index 0000000..dabe502
 --- /dev/null
 +++ b/src-tauri/src/commands/cloud_web.rs
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,985 @@
 +//! Product-owned embedded browser controller. The remote page never receives an
 +//! MXU API, executable path, socket, or MaaFramework handle.
 +//!
@@ -13,7 +13,7 @@ index 0000000..b42b149
 +use base64::{engine::general_purpose::STANDARD, Engine};
 +use maa_framework::controller::Controller;
 +use maa_framework::custom_controller::CustomControllerCallback;
-+use serde::Deserialize;
++use serde::{Deserialize, Serialize};
 +use serde_json::{json, Value};
 +use std::io::{BufRead, BufReader, Write};
 +use std::path::Path;
@@ -27,6 +27,36 @@ index 0000000..b42b149
 +const ACTION_TIMEOUT: Duration = Duration::from_secs(12);
 +const CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
 +const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
++
++#[derive(Debug, Deserialize, Serialize, PartialEq)]
++#[serde(rename_all = "snake_case")]
++pub enum CloudWebAuthState {
++    Unknown,
++    LoginRequired,
++    Authenticated,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum CloudWebServiceState {
++    Loading,
++    WaitingForOfficialPage,
++    LoginRequired,
++    Starting,
++    Reconnecting,
++    WaitingForStream,
++    StreamReady,
++    ObservationStale,
++}
++
++/// Only fixed enums and a boolean cross into the UI, never page text or auth data.
++#[derive(Debug, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct CloudWebServiceStatus {
++    pub auth: CloudWebAuthState,
++    pub service: CloudWebServiceState,
++    pub ready: bool,
++}
 +
 +#[derive(Debug, Deserialize)]
 +struct HostReply {
@@ -105,6 +135,34 @@ index 0000000..b42b149
 +impl CloudWebSession {
 +    pub fn is_healthy(&self) -> bool {
 +        self.healthy.load(Ordering::Acquire)
++    }
++
++    pub fn show_browser(&self) -> Result<(), String> {
++        match self.request("show", json!({}), ACTION_TIMEOUT)?.as_bool() {
++            Some(true) => Ok(()),
++            _ => Err("CLOUD_WEB_REJECTED".into()),
++        }
++    }
++
++    pub fn service_status(&self) -> Result<Option<CloudWebServiceStatus>, String> {
++        // A UI status refresh must never queue behind connection/input work and
++        // turn a healthy, busy browser into a protocol timeout.
++        let _guard = match self.request_gate.try_lock() {
++            Ok(guard) => guard,
++            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
++            Err(std::sync::TryLockError::Poisoned(_)) => {
++                return Err("CLOUD_WEB_PROTOCOL_ERROR".into())
++            }
++        };
++        let value = self.request_locked("service_status", json!({}), STATUS_TIMEOUT)?;
++        let status: CloudWebServiceStatus =
++            serde_json::from_value(value).map_err(|_| "CLOUD_WEB_PROTOCOL_ERROR".to_string())?;
++        if status.auth == CloudWebAuthState::LoginRequired {
++            // Re-authentication needs an explicit new Connect, not an automatic
++            // task resume when the login dialog disappears.
++            self.ready.store(false, Ordering::Release);
++        }
++        Ok(Some(status))
 +    }
 +
 +    fn spawn(executable: &Path, url: &str, session_id: &str) -> Result<Arc<Self>, String> {
@@ -301,6 +359,11 @@ index 0000000..b42b149
 +        if !self.input_enabled.load(Ordering::Acquire) && method != "inactive" {
 +            return false;
 +        }
++        if !self.ready.load(Ordering::Acquire)
++            && !matches!(method, "inactive" | "key_up" | "touch_up")
++        {
++            return false;
++        }
 +        self.request(method, params, ACTION_TIMEOUT)
 +            .ok()
 +            .and_then(|v| v.as_bool())
@@ -343,6 +406,7 @@ index 0000000..b42b149
 +        };
 +        if self.pending_releases.load(Ordering::Acquire) != 0
 +            || !self.healthy.load(Ordering::Acquire)
++            || !self.ready.load(Ordering::Acquire)
 +        {
 +            return false;
 +        }
@@ -446,11 +510,15 @@ index 0000000..b42b149
 +                Err(std::sync::TryLockError::WouldBlock) => return true,
 +                Err(std::sync::TryLockError::Poisoned(_)) => return false,
 +            };
-+            session
++            let connected = session
 +                .request_locked("connected", json!({}), STATUS_TIMEOUT)
 +                .ok()
 +                .and_then(|value| value.as_bool())
-+                == Some(true)
++                == Some(true);
++            if !connected {
++                session.ready.store(false, Ordering::Release);
++            }
++            connected
 +        })
 +    }
 +    fn request_uuid(&self) -> Option<String> {
@@ -984,7 +1052,7 @@ index d276381..3c57858 100644
              // 首批：重置任务运行状态
              instance.task_ids.clear();
 diff --git a/src-tauri/src/commands/maa_core.rs b/src-tauri/src/commands/maa_core.rs
-index c32d227..ffa587f 100644
+index c32d227..b38c255 100644
 --- a/src-tauri/src/commands/maa_core.rs
 +++ b/src-tauri/src/commands/maa_core.rs
 @@ -322,24 +322,44 @@ fn update_instance_controller(
@@ -1192,7 +1260,7 @@ index c32d227..ffa587f 100644
  
          Ok(conn_id)
      })
-@@ -1119,6 +1205,58 @@ mod tests {
+@@ -1119,6 +1205,101 @@ mod tests {
  
  /// 连接控制器（异步，通过回调通知完成状态）
  /// 返回连接请求 ID，前端通过监听 maa-callback 事件获取完成状态
@@ -1209,7 +1277,7 @@ index c32d227..ffa587f 100644
 +            url: url.clone(),
 +            session_id: instance_id.clone(),
 +        };
-+        let old = {
++        let (existing, old) = {
 +            let mut instances = state.instances.lock().map_err(|e| e.to_string())?;
 +            let instance = instances
 +                .get_mut(&instance_id)
@@ -1218,7 +1286,6 @@ index c32d227..ffa587f 100644
 +                .tasker
 +                .as_ref()
 +                .is_some_and(|tasker| tasker.running())
-+                || instance.controller.is_some()
 +            {
 +                return Err("CLOUD_WEB_RECONNECT_RUNNING".to_string());
 +            }
@@ -1228,10 +1295,19 @@ index c32d227..ffa587f 100644
 +                    .as_ref()
 +                    .is_some_and(|session| session.is_healthy())
 +            {
-+                return Ok(());
++                (instance.cloud_web_session.clone(), None)
++            } else {
++                // Reopen the existing browser even with a bound controller, but
++                // changing a live controller's URL still requires disconnect.
++                if instance.controller.is_some() {
++                    return Err("CLOUD_WEB_RECONNECT_RUNNING".to_string());
++                }
++                (None, instance.cloud_web_session.take())
 +            }
-+            instance.cloud_web_session.take()
 +        };
++        if let Some(existing) = existing {
++            return existing.show_browser();
++        }
 +        if let Some(old) = old {
 +            old.shutdown();
 +        }
@@ -1248,10 +1324,45 @@ index c32d227..ffa587f 100644
 +    .map_err(|e| e.to_string())?
 +}
 +
++/// Bounded read-only state for the selected CloudWeb connection panel.
++#[tauri::command]
++pub async fn maa_cloud_web_status(
++    state: State<'_, Arc<MaaState>>,
++    instance_id: String,
++    url: String,
++) -> Result<Option<super::cloud_web::CloudWebServiceStatus>, String> {
++    let state = state.inner().clone();
++    tokio::task::spawn_blocking(move || {
++        let session = {
++            let instances = state.instances.lock().map_err(|e| e.to_string())?;
++            let Some(instance) = instances.get(&instance_id) else {
++                return Ok(None);
++            };
++            let expected = ControllerConfig::CloudWeb {
++                url,
++                session_id: instance_id.clone(),
++            };
++            if instance.controller_config.as_ref() != Some(&expected) {
++                return Ok(None);
++            }
++            if instance.tasker.as_ref().is_some_and(|tasker| tasker.running()) {
++                return Ok(None);
++            }
++            instance.cloud_web_session.clone()
++        };
++        match session {
++            Some(session) if session.is_healthy() => session.service_status(),
++            _ => Ok(None),
++        }
++    })
++    .await
++    .map_err(|e| e.to_string())?
++}
++
  #[tauri::command]
  pub async fn maa_connect_controller(
      app: tauri::AppHandle,
-@@ -1374,6 +1512,17 @@ pub fn run_task_impl(
+@@ -1374,6 +1555,17 @@ pub fn run_task_impl(
          return Err("Tasker not initialized even after rebuild".to_string());
      }
  
@@ -1269,7 +1380,7 @@ index c32d227..ffa587f 100644
      let job = tasker
          .post_task(entry, pipeline_override)
          .map_err(|e| e.to_string())?;
-@@ -1494,7 +1643,18 @@ pub fn stop_task_impl(state: &MaaState, instance_id: &str) -> Result<(), String>
+@@ -1494,7 +1686,18 @@ pub fn stop_task_impl(state: &MaaState, instance_id: &str) -> Result<(), String>
      // 遥测：用户取消，以 cancelled 结束当前运行的 Transaction（幂等，仅首次生效）
      super::telemetry::on_run_cancelled(instance_id);
  
@@ -1363,18 +1474,19 @@ index abe9de5..45bab2e 100644
      pub fn cleanup_all_agent_children(&self) {
          if let Ok(mut instances) = self.instances.lock() {
 diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
-index 444a547..471071e 100644
+index 444a547..f1a72ff 100644
 --- a/src-tauri/src/lib.rs
 +++ b/src-tauri/src/lib.rs
-@@ -228,6 +228,7 @@ pub fn run() {
+@@ -228,6 +228,8 @@ pub fn run() {
              commands::maa_core::maa_create_instance,
              commands::maa_core::maa_destroy_instance,
              commands::maa_core::maa_connect_controller,
 +            commands::maa_core::maa_cloud_web_login,
++            commands::maa_core::maa_cloud_web_status,
              commands::maa_core::maa_get_connection_status,
              commands::maa_core::maa_load_resource,
              commands::maa_core::maa_is_resource_loaded,
-@@ -331,6 +332,7 @@ pub fn run() {
+@@ -331,6 +333,7 @@ pub fn run() {
                  tauri::WindowEvent::Destroyed => {
                      if let Some(state) = window.try_state::<Arc<MaaState>>() {
                          state.cleanup_all_agent_children();
@@ -1382,7 +1494,7 @@ index 444a547..471071e 100644
                      }
                  }
                  _ => {}
-@@ -338,9 +340,12 @@ pub fn run() {
+@@ -338,9 +341,12 @@ pub fn run() {
          })
          .build(tauri::generate_context!())
          .expect("error while building tauri application")
@@ -1525,7 +1637,7 @@ index 384bdf5..8f76f98 100644
          Some(p) if !p.trim().is_empty() => p.to_string(),
          _ => {
 diff --git a/src/components/ConnectionPanel.tsx b/src/components/ConnectionPanel.tsx
-index 9744492..42daa5f 100644
+index 9744492..fbda52c 100644
 --- a/src/components/ConnectionPanel.tsx
 +++ b/src/components/ConnectionPanel.tsx
 @@ -6,6 +6,7 @@ import {
@@ -1536,7 +1648,22 @@ index 9744492..42daa5f 100644
    RefreshCw,
    Loader2,
    Check,
-@@ -36,6 +37,13 @@ import {
+@@ -21,7 +22,13 @@ import { maaService } from '@/services/maaService';
+ import { useAppStore } from '@/stores/appStore';
+ import { resolveI18nText } from '@/services/contentResolver';
+ import { LinuxInputMethod, parseLinuxInputMethod } from '@/types/maa';
+-import type { AdbDevice, Win32Window, GamescopeInstance, ControllerConfig } from '@/types/maa';
++import type {
++  AdbDevice,
++  Win32Window,
++  GamescopeInstance,
++  ControllerConfig,
++  CloudWebServiceStatus,
++} from '@/types/maa';
+ import type { ControllerItem, ResourceItem } from '@/types/interface';
+ import { computeResourcePaths } from '@/utils/resourcePath';
+ import { getProcessNameFromPath } from '@/utils/paths';
+@@ -36,6 +43,13 @@ import {
  } from '@/utils/controller';
  import { getInterfaceLangKey } from '@/i18n';
  import { generateId } from '@/stores/helpers';
@@ -1550,41 +1677,88 @@ index 9744492..42daa5f 100644
  import {
    startGlobalCallbackListener,
    waitForCtrlResult,
-@@ -212,6 +220,7 @@ export function ConnectionPanel() {
+@@ -99,6 +113,7 @@ export function ConnectionPanel() {
+   const [isSearching, setIsSearching] = useState(false);
+   const [isConnecting, setIsConnecting] = useState(false);
+   const [isConnected, setIsConnected] = useState(false);
++  const [cloudWebStatus, setCloudWebStatus] = useState<CloudWebServiceStatus | null>(null);
+   const [deviceError, setDeviceError] = useState<string | null>(null);
+   const [selectedAdbDevice, setSelectedAdbDevice] = useState<AdbDevice | null>(null);
+   const [selectedWindow, setSelectedWindow] = useState<Win32Window | null>(null);
+@@ -212,6 +227,58 @@ export function ConnectionPanel() {
    const currentController =
      controllers.find((c) => c.name === currentControllerName) || controllers[0];
    const controllerType = currentController?.type;
 +  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
++  // View-only snapshot; native host remains the source of truth. Never persist auth state.
++  useEffect(() => {
++    setCloudWebStatus(null);
++  }, [instanceId, currentControllerName, cloudWebUrl]);
++
++  useEffect(() => {
++    if (controllerType !== 'CloudWeb' || !instanceId || isConnecting || isRunning) return;
++    let cancelled = false;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    const poll = async () => {
++      try {
++        const status = await maaService.getCloudWebStatus(instanceId, cloudWebUrl);
++        if (cancelled) return;
++        setCloudWebStatus(status);
++        if (status?.auth === 'login_required') {
++          // Do not destroy the browser/profile or automatically reconnect after reauthentication.
++          autoReconnectAttempted.add(instanceId);
++          setIsConnected(false);
++          setIsResourceLoaded(false);
++          const store = useAppStore.getState();
++          if (store.instanceConnectionStatus[instanceId] !== 'Disconnected') {
++            setInstanceConnectionStatus(instanceId, 'Disconnected');
++          }
++          if (store.instanceResourceLoaded[instanceId]) {
++            setInstanceResourceLoaded(instanceId, false);
++          }
++        }
++      } catch {
++        // Transport failure is not proof of expired authentication.
++        if (!cancelled) setCloudWebStatus(null);
++      } finally {
++        if (!cancelled) timer = setTimeout(poll, 2000);
++      }
++    };
++    void poll();
++    return () => {
++      cancelled = true;
++      if (timer) clearTimeout(timer);
++    };
++  }, [
++    controllerType,
++    currentControllerName,
++    instanceId,
++    cloudWebUrl,
++    isConnecting,
++    isRunning,
++    setInstanceConnectionStatus,
++    setInstanceResourceLoaded,
++  ]);
++
++  const visibleCloudWebStatus = isConnecting || isRunning ? null : cloudWebStatus;
    const isDesktopWindowController = isDesktopWindowControllerType(controllerType);
    const { classRegex: desktopWindowClassRegex, titleRegex: desktopWindowTitleRegex } =
      getDesktopWindowFilters(currentController);
-@@ -399,14 +408,18 @@ export function ConnectionPanel() {
-           ((savedDevice.gamescopeDisplayNo !== undefined &&
-             (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
-             (savedDevice.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
--        (controllerType === 'PlayCover' && savedDevice.playcoverAddress));
-+        (controllerType === 'PlayCover' && savedDevice.playcoverAddress) ||
-+        (controllerType === 'CloudWeb' && savedDevice.cloudWebUrl !== undefined));
- 
-     if (hasHistoricalDevice && needsDeviceSearch) {
-       // 标记该实例已尝试过自动重连
-       autoReconnectAttempted.add(instanceId);
-       // 触发搜索并自动连接（handleSearch 内部已有匹配+自动连接逻辑）
-       handleSearch();
--    } else if (hasHistoricalDevice && controllerType === 'PlayCover') {
-+    } else if (
-+      hasHistoricalDevice &&
-+      (controllerType === 'PlayCover' || controllerType === 'CloudWeb')
-+    ) {
-       // PlayCover 不需要搜索，直接连接
-       autoReconnectAttempted.add(instanceId);
-       handleConnect();
-@@ -633,8 +646,32 @@ export function ConnectionPanel() {
+@@ -379,6 +446,8 @@ export function ConnectionPanel() {
+   // 应用启动/实例切换时自动重连之前保存的设备
+   useEffect(() => {
+     if (!instanceId || !activeInstance || !currentController) return;
++    // CloudWeb must only connect via the explicit Connect button, including after login recovery.
++    if (controllerType === 'CloudWeb') return;
+
+     // 如果已连接或正在连接/搜索，不触发自动重连
+     if (isConnected || isConnecting || isSearching) return;
+@@ -633,8 +702,32 @@ export function ConnectionPanel() {
    };
  
    // 连接设备
 +  const handleCloudWebLogin = async () => {
-+    if (isConnecting || isConnected || isRunning || !cloudWebUrl.trim()) return;
++    if (isConnecting || isRunning || !cloudWebUrl.trim()) return;
 +    setIsConnecting(true);
 +    setDeviceError(null);
 +    autoReconnectAttempted.add(instanceId);
@@ -1613,7 +1787,7 @@ index 9744492..42daa5f 100644
  
      setIsConnecting(true);
      setDeviceError(null);
-@@ -682,6 +719,13 @@ export function ConnectionPanel() {
+@@ -682,6 +775,13 @@ export function ConnectionPanel() {
          };
          deviceName = selectedWlrootsSocket;
          targetType = 'device';
@@ -1627,7 +1801,7 @@ index 9744492..42daa5f 100644
        } else if (controllerType === 'PlayCover') {
          // 保存 PlayCover 地址到实例配置
          setInstanceSavedDevice(instanceId, { playcoverAddress });
-@@ -826,6 +870,8 @@ export function ConnectionPanel() {
+@@ -826,6 +926,8 @@ export function ConnectionPanel() {
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1636,7 +1810,7 @@ index 9744492..42daa5f 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -1395,6 +1441,8 @@ export function ConnectionPanel() {
+@@ -1395,6 +1497,8 @@ export function ConnectionPanel() {
        return isLinuxReadyWith(selectedGamescopeInstance, selectedWlrootsSocket);
      }
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
@@ -1645,7 +1819,7 @@ index 9744492..42daa5f 100644
      return false;
    };
  
-@@ -1421,6 +1469,9 @@ export function ConnectionPanel() {
+@@ -1421,6 +1525,9 @@ export function ConnectionPanel() {
      // 获取设备显示文本（优先显示具体设备名）
      const getDeviceStatusText = () => {
        const savedDevice = activeInstance?.savedDevice;
@@ -1655,7 +1829,7 @@ index 9744492..42daa5f 100644
        if (savedDevice?.adbDeviceName) {
          return truncateText(savedDevice.adbDeviceName, 6);
        }
-@@ -1469,7 +1520,8 @@ export function ConnectionPanel() {
+@@ -1469,7 +1576,8 @@ export function ConnectionPanel() {
            ((s.gamescopeDisplayNo !== undefined &&
              (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
              (s.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
@@ -1665,7 +1839,7 @@ index 9744492..42daa5f 100644
        );
      };
  
-@@ -1668,6 +1720,89 @@ export function ConnectionPanel() {
+@@ -1668,6 +1776,94 @@ export function ConnectionPanel() {
                </div>
              )}
  
@@ -1687,16 +1861,10 @@ index 9744492..42daa5f 100644
 +                <div className="flex gap-2">
 +                  <button
 +                    onClick={handleCloudWebLogin}
-+                    disabled={
-+                      isConnecting ||
-+                      isConnected ||
-+                      isRunning ||
-+                      !cloudWebUrl.trim() ||
-+                      !canConnect()
-+                    }
++                    disabled={isConnecting || isRunning || !cloudWebUrl.trim() || !canConnect()}
 +                    className="flex-1 px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50"
 +                  >
-+                    {t('controller.cloudWebLogin')}
++                    {t('controller.cloudWebLoginWindow')}
 +                  </button>
 +                  <button
 +                    onClick={
@@ -1747,6 +1915,17 @@ index 9744492..42daa5f 100644
 +                          : 'controller.connect',
 +                    )}
 +                  </button>
++                </div>
++                <div className="space-y-1 text-xs text-text-muted" role="status" aria-live="polite">
++                  <p>{t(`controller.cloudWebAuth_${visibleCloudWebStatus?.auth ?? 'unknown'}`)}</p>
++                  <p>
++                    {t(
++                      `controller.cloudWebService_${visibleCloudWebStatus?.service ?? 'unavailable'}`,
++                    )}
++                  </p>
++                  {visibleCloudWebStatus?.auth === 'login_required' && (
++                    <p className="text-warning">{t('controller.cloudWebReauthenticate')}</p>
++                  )}
 +                </div>
 +                <p className="text-xs text-text-muted">{t('controller.cloudWebPreviewNote')}</p>
 +              </div>
@@ -1873,23 +2052,10 @@ index 2546c91..6563886 100644
              'w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors',
              isConnecting || !canConnect()
 diff --git a/src/components/Toolbar.tsx b/src/components/Toolbar.tsx
-index 644006d..ef19a91 100644
+index 644006d..82d1273 100644
 --- a/src/components/Toolbar.tsx
 +++ b/src/components/Toolbar.tsx
-@@ -40,6 +40,12 @@ import {
-   getLinuxDiscoveryNeeds,
-   isDesktopWindowControllerType,
- } from '@/utils/controller';
-+import {
-+  OFFICIAL_CLOUD_WEB_URL,
-+  buildCloudWebControllerConfig,
-+  isValidCloudWebUrl,
-+  getCloudWebDeviceName,
-+} from '@/utils/cloudWebController';
- import { SchedulePanel } from './SchedulePanel';
- import type {
-   Instance,
-@@ -433,7 +439,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+@@ -433,7 +433,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
          (savedDevice.adbDeviceName ||
            savedDevice.windowName ||
            savedDevice.wlrSocketPath ||
@@ -1899,24 +2065,34 @@ index 644006d..ef19a91 100644
        );
        if (!controller) {
          return failStart(t('errors.controllerNotFound'));
-@@ -769,7 +776,16 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
-           let deviceName = '';
-           let targetType: 'device' | 'window' = 'device';
+@@ -464,6 +465,17 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+       }
  
--          if (canUseSavedDevice && savedDevice && controllerType) {
+       try {
++        // CloudWeb authentication recovery is manual. Do not run pre-actions or
++        // create/connect a browser as a side effect of Start or a schedule.
++        if (controller.type === 'CloudWeb') {
++          const backendState = isTargetConnected
++            ? await maaService.getInstanceState(targetId)
++            : null;
++          if (!backendState || backendState.connectionStatus !== 'Connected') {
++            setInstanceConnectionStatus(targetId, 'Disconnected');
++            return failStart(t('controller.cloudWebManualConnect'));
++          }
++        }
+         let needsReconnect = false;
+         let shouldDelayAfterAdbConnected = false;
+
+@@ -759,6 +771,9 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+         // 如果未连接（或需要重连），尝试自动连接
+         if (!isTargetConnected || needsReconnect) {
+           const controllerType = controller?.type;
 +          if (controllerType === 'CloudWeb') {
-+            const url = savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
-+            if (!isValidCloudWebUrl(url)) return failStart(t('controller.cloudWebInvalidUrl'));
-+            config = buildCloudWebControllerConfig(targetId, url);
-+            deviceName = getCloudWebDeviceName(config.url, t('controller.cloudWebFixture'));
-+            useAppStore.getState().setInstanceSavedDevice(targetId, {
-+              ...savedDevice,
-+              cloudWebUrl: config.url,
-+            });
-+          } else if (canUseSavedDevice && savedDevice && controllerType) {
-             // 有保存的设备配置，地址优先匹配，兼容旧配置按名称匹配
-             log.info(`实例 ${targetInstance.name}: 自动连接已保存的设备...`);
-             onPhaseChange?.('searching');
++            return failStart(t('controller.cloudWebManualConnect'));
++          }
+
+           await ensureMaaInitialized();
+           await maaService.createInstance(targetId).catch((err) => {
 diff --git a/src/components/connection/CloudWebUrlInput.tsx b/src/components/connection/CloudWebUrlInput.tsx
 new file mode 100644
 index 0000000..73fae30
@@ -2102,13 +2278,30 @@ index bcc696b..fa1a09e 100644
      canConnect,
      ensureMaaInitialized,
 diff --git a/src/i18n/locales/en-US.ts b/src/i18n/locales/en-US.ts
-index 154e625..e0c085a 100644
+index 154e625..d8aba90 100644
 --- a/src/i18n/locales/en-US.ts
 +++ b/src/i18n/locales/en-US.ts
-@@ -402,6 +402,29 @@ export default {
+@@ -402,6 +402,46 @@ export default {
  
    // Controller
    controller: {
++    cloudWebManualConnect:
++      'Log in and click Connect manually in the connection panel first. Starting or scheduling tasks never connects the cloud game automatically.',
++    cloudWebLoginWindow: 'Log in / Show window',
++    cloudWebAuth_unknown: 'Login: unconfirmed (not necessarily expired)',
++    cloudWebAuth_login_required: 'Login: requested by the page',
++    cloudWebAuth_authenticated: 'Login: confirmed by the game stream (not live token validation)',
++    cloudWebService_unavailable: 'Service: no current observation',
++    cloudWebService_loading: 'Service: loading page',
++    cloudWebService_waiting_for_official_page: 'Service: waiting for the official game page',
++    cloudWebService_login_required: 'Service: waiting for manual login',
++    cloudWebService_starting: 'Service: starting game',
++    cloudWebService_reconnecting: 'Service: reconnecting (does not imply login expiry)',
++    cloudWebService_waiting_for_stream: 'Service: waiting for a playable game stream',
++    cloudWebService_stream_ready: 'Service: game stream ready',
++    cloudWebService_observation_stale: 'Service: observation stale; waiting for fresh state',
++    cloudWebReauthenticate:
++      'Open the login window, log in and start the game manually, then click Connect. Existing login data is retained; tasks never start automatically.',
 +    cloudWebHostMissing:
 +      'Cloud browser component is missing. Install the complete CloudWeb package',
 +    cloudWebConnectionFailed:
@@ -2136,13 +2329,31 @@ index 154e625..e0c085a 100644
      selectController: 'Select Controller',
      adb: 'Android Device',
 diff --git a/src/i18n/locales/ja-JP.ts b/src/i18n/locales/ja-JP.ts
-index 15e63a1..95713ae 100644
+index 15e63a1..a57d945 100644
 --- a/src/i18n/locales/ja-JP.ts
 +++ b/src/i18n/locales/ja-JP.ts
-@@ -397,6 +397,28 @@ export default {
+@@ -397,6 +397,46 @@ export default {
  
    // コントローラー
    controller: {
++    cloudWebManualConnect:
++      '接続パネルで手動ログインし、「接続」を押してください。タスク開始やスケジュール実行ではクラウドゲームに自動接続しません。',
++    cloudWebLoginWindow: 'ログイン / 画面を表示',
++    cloudWebAuth_unknown: 'ログイン状態：未確認（期限切れとは限りません）',
++    cloudWebAuth_login_required: 'ログイン状態：ページがログインを要求しています',
++    cloudWebAuth_authenticated:
++      'ログイン状態：ゲーム映像から確認済み（トークンのリアルタイム検証ではありません）',
++    cloudWebService_unavailable: 'サービス状態：現在の観測なし',
++    cloudWebService_loading: 'サービス状態：ページ読み込み中',
++    cloudWebService_waiting_for_official_page: 'サービス状態：公式ゲームページ待ち',
++    cloudWebService_login_required: 'サービス状態：手動ログイン待ち',
++    cloudWebService_starting: 'サービス状態：ゲーム起動中',
++    cloudWebService_reconnecting: 'サービス状態：再接続中（ログイン期限切れを意味しません）',
++    cloudWebService_waiting_for_stream: 'サービス状態：再生可能なゲーム映像待ち',
++    cloudWebService_stream_ready: 'サービス状態：ゲーム映像の準備完了',
++    cloudWebService_observation_stale: 'サービス状態：観測が古いため更新待ち',
++    cloudWebReauthenticate:
++      'ログイン画面を開き、手動でログインしてゲームを開始してから接続してください。保存済みログイン情報は保持され、タスクは自動開始しません。',
 +    cloudWebHostMissing:
 +      'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
 +    cloudWebConnectionFailed:
@@ -2169,13 +2380,30 @@ index 15e63a1..95713ae 100644
      selectController: 'コントローラーを選択',
      adb: 'Android デバイス',
 diff --git a/src/i18n/locales/ko-KR.ts b/src/i18n/locales/ko-KR.ts
-index c3bee79..3e33d75 100644
+index c3bee79..7907bdd 100644
 --- a/src/i18n/locales/ko-KR.ts
 +++ b/src/i18n/locales/ko-KR.ts
-@@ -392,6 +392,26 @@ export default {
+@@ -392,6 +392,43 @@ export default {
  
    // 컨트롤러
    controller: {
++    cloudWebManualConnect:
++      '연결 패널에서 직접 로그인하고 연결 버튼을 먼저 누르세요. 작업 시작이나 예약 실행으로 클라우드 게임에 자동 연결하지 않습니다.',
++    cloudWebLoginWindow: '로그인 / 창 표시',
++    cloudWebAuth_unknown: '로그인 상태: 미확인 (만료되었다는 뜻이 아님)',
++    cloudWebAuth_login_required: '로그인 상태: 페이지에서 로그인 요청',
++    cloudWebAuth_authenticated: '로그인 상태: 게임 영상으로 확인됨 (실시간 토큰 검증 아님)',
++    cloudWebService_unavailable: '서비스 상태: 현재 관찰 정보 없음',
++    cloudWebService_loading: '서비스 상태: 페이지 로딩 중',
++    cloudWebService_waiting_for_official_page: '서비스 상태: 공식 게임 페이지 대기 중',
++    cloudWebService_login_required: '서비스 상태: 직접 로그인 대기 중',
++    cloudWebService_starting: '서비스 상태: 게임 시작 중',
++    cloudWebService_reconnecting: '서비스 상태: 재연결 중 (로그인 만료를 의미하지 않음)',
++    cloudWebService_waiting_for_stream: '서비스 상태: 재생 가능한 게임 영상 대기 중',
++    cloudWebService_stream_ready: '서비스 상태: 게임 영상 준비됨',
++    cloudWebService_observation_stale: '서비스 상태: 관찰 정보가 오래되어 갱신 대기 중',
++    cloudWebReauthenticate:
++      '로그인 창을 열어 직접 로그인하고 게임을 시작한 다음 연결을 누르세요. 기존 로그인 정보는 유지되며 작업은 자동 시작되지 않습니다.',
 +    cloudWebHostMissing: '클라우드 브라우저 구성 요소가 없습니다. 전체 웹 버전 패키지를 설치하세요',
 +    cloudWebConnectionFailed:
 +      '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
@@ -2200,13 +2428,30 @@ index c3bee79..3e33d75 100644
      selectController: '컨트롤러 선택',
      adb: 'Android 기기',
 diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
-index 3dca5fc..a26e54d 100644
+index 3dca5fc..0f90e4d 100644
 --- a/src/i18n/locales/zh-CN.ts
 +++ b/src/i18n/locales/zh-CN.ts
-@@ -390,6 +390,24 @@ export default {
+@@ -390,6 +390,41 @@ export default {
  
    // 控制器
    controller: {
++    cloudWebManualConnect:
++      '请先在连接面板手动登录并点击“连接”。任务启动或定时任务不会自动连接云游戏。',
++    cloudWebLoginWindow: '登录 / 显示窗口',
++    cloudWebAuth_unknown: '登录状态：未确认（不等于已失效）',
++    cloudWebAuth_login_required: '登录状态：页面要求登录',
++    cloudWebAuth_authenticated: '登录状态：已由游戏串流确认（非实时令牌校验）',
++    cloudWebService_unavailable: '服务状态：尚无可用观察',
++    cloudWebService_loading: '服务状态：页面加载中',
++    cloudWebService_waiting_for_official_page: '服务状态：等待官方游戏页面',
++    cloudWebService_login_required: '服务状态：等待手动登录',
++    cloudWebService_starting: '服务状态：游戏启动中',
++    cloudWebService_reconnecting: '服务状态：游戏重连中（不代表登录失效）',
++    cloudWebService_waiting_for_stream: '服务状态：等待可播放的游戏串流',
++    cloudWebService_stream_ready: '服务状态：游戏串流就绪',
++    cloudWebService_observation_stale: '服务状态：观察已过期，等待新状态',
++    cloudWebReauthenticate:
++      '请打开登录窗口手动完成登录并开始游戏，再点击连接。保留已有登录配置，不会自动运行任务。',
 +    cloudWebHostMissing: '云游戏浏览器组件缺失，请安装完整的网页版构建包',
 +    cloudWebConnectionFailed: '云游戏控制器连接失败，请断开后重连；仍失败时请查看日志',
 +    cloudWebTimeout: '云游戏响应超时，请检查连接并重试',
@@ -2229,13 +2474,30 @@ index 3dca5fc..a26e54d 100644
      selectController: '选择控制器',
      adb: 'Android 设备',
 diff --git a/src/i18n/locales/zh-TW.ts b/src/i18n/locales/zh-TW.ts
-index f73ab27..c6399c6 100644
+index f73ab27..72fe049 100644
 --- a/src/i18n/locales/zh-TW.ts
 +++ b/src/i18n/locales/zh-TW.ts
-@@ -386,6 +386,24 @@ export default {
+@@ -386,6 +386,41 @@ export default {
  
    // 控制器
    controller: {
++    cloudWebManualConnect:
++      '請先在連線面板手動登入並點擊「連線」。任務啟動或排程任務不會自動連線雲端遊戲。',
++    cloudWebLoginWindow: '登入 / 顯示視窗',
++    cloudWebAuth_unknown: '登入狀態：未確認（不等於已失效）',
++    cloudWebAuth_login_required: '登入狀態：頁面要求登入',
++    cloudWebAuth_authenticated: '登入狀態：已由遊戲串流確認（非即時權杖驗證）',
++    cloudWebService_unavailable: '服務狀態：尚無可用觀察',
++    cloudWebService_loading: '服務狀態：頁面載入中',
++    cloudWebService_waiting_for_official_page: '服務狀態：等待官方遊戲頁面',
++    cloudWebService_login_required: '服務狀態：等待手動登入',
++    cloudWebService_starting: '服務狀態：遊戲啟動中',
++    cloudWebService_reconnecting: '服務狀態：遊戲重新連線中（不代表登入失效）',
++    cloudWebService_waiting_for_stream: '服務狀態：等待可播放的遊戲串流',
++    cloudWebService_stream_ready: '服務狀態：遊戲串流就緒',
++    cloudWebService_observation_stale: '服務狀態：觀察已過期，等待新狀態',
++    cloudWebReauthenticate:
++      '請開啟登入視窗手動完成登入並開始遊戲，再點擊連線。保留已有登入設定，不會自動執行任務。',
 +    cloudWebHostMissing: '雲端遊戲瀏覽器元件遺失，請安裝完整網頁版套件',
 +    cloudWebConnectionFailed: '雲端遊戲控制器連線失敗，請斷線後重連；仍失敗時請查看日誌',
 +    cloudWebTimeout: '雲端遊戲回應逾時，請檢查連線後重試',
@@ -2356,10 +2618,18 @@ index aa3744c..eefdfe3 100644
      // 过滤掉当前平台不支持的控制器（纯前端 dev 预览无后端，回退到浏览器平台）
      filterControllersByPlatform(pi, '');
 diff --git a/src/services/maaService.ts b/src/services/maaService.ts
-index 62be25e..f5fe02c 100644
+index 62be25e..6772886 100644
 --- a/src/services/maaService.ts
 +++ b/src/services/maaService.ts
-@@ -19,12 +19,15 @@ import { loggers } from '@/utils/logger';
+@@ -8,6 +8,7 @@ import type {
+   Win32Window,
+   GamescopeInstance,
+   ControllerConfig,
++  CloudWebServiceStatus,
+   ConnectionStatus,
+   TaskStatus,
+   AgentConfig,
+@@ -19,12 +20,15 @@ import { loggers } from '@/utils/logger';
  import { redactSecretsInText } from '@/utils/passwordOptionValues';
  import { isTauri } from '@/utils/paths';
  import i18n from '@/i18n';
@@ -2375,10 +2645,23 @@ index 62be25e..f5fe02c 100644
    const message = error instanceof Error ? error.message : String(error);
    if (message.includes('MACOS_PERMISSIONS_REQUIRED')) {
      return new Error(i18n.t('controller.macosPermissionsRequired'));
-@@ -108,6 +111,14 @@ export interface SelfStopRequestedEvent {
+@@ -108,6 +112,27 @@ export interface SelfStopRequestedEvent {
  
  /** MaaFramework 服务 */
  export const maaService = {
++  async getCloudWebStatus(instanceId: string, url: string): Promise<CloudWebServiceStatus | null> {
++    // Browser-only WebUI has no native owned browser/status command.
++    if (!isTauri()) return null;
++    try {
++      return await invoke<CloudWebServiceStatus | null>('maa_cloud_web_status', {
++        instanceId,
++        url: url.trim(),
++      });
++    } catch (error) {
++      throw localizeControllerError(error);
++    }
++  },
++
 +  async openCloudWebLogin(instanceId: string, url: string): Promise<void> {
 +    try {
 +      await invoke('maa_cloud_web_login', { instanceId, url });
@@ -2390,7 +2673,7 @@ index 62be25e..f5fe02c 100644
    /**
     * 初始化 MaaFramework
     * @param libDir MaaFramework 库目录（可选，默认从 exe 目录/maafw 加载）
-@@ -298,14 +309,18 @@ export const maaService = {
+@@ -298,14 +323,18 @@ export const maaService = {
     * @param instanceId 实例 ID
     */
    async destroyInstance(instanceId: string): Promise<void> {
@@ -2416,7 +2699,7 @@ index 62be25e..f5fe02c 100644
    },
  
    /**
-@@ -316,7 +331,11 @@ export const maaService = {
+@@ -316,7 +345,11 @@ export const maaService = {
     */
    async connectController(instanceId: string, config: ControllerConfig): Promise<number> {
      log.info('连接控制器, 实例:', instanceId, '类型:', config.type);
@@ -2429,7 +2712,7 @@ index 62be25e..f5fe02c 100644
  
      try {
        if (!isTauri()) {
-@@ -433,31 +452,35 @@ export const maaService = {
+@@ -433,31 +466,35 @@ export const maaService = {
      pipelineOverride: string = '{}',
      selectedTaskId?: string,
    ): Promise<number> {
@@ -2487,7 +2770,7 @@ index 62be25e..f5fe02c 100644
    },
  
    /**
-@@ -478,14 +501,18 @@ export const maaService = {
+@@ -478,14 +515,18 @@ export const maaService = {
     * @param instanceId 实例 ID
     */
    async stopTask(instanceId: string): Promise<void> {
@@ -2513,7 +2796,7 @@ index 62be25e..f5fe02c 100644
    },
  
    /**
-@@ -646,51 +673,55 @@ export const maaService = {
+@@ -646,51 +687,55 @@ export const maaService = {
      controllerInfo?: ControllerTelemetryInfo,
      logRedactSecrets?: string[],
    ): Promise<number[]> {
@@ -2665,10 +2948,10 @@ index 0dcc16f..d716408 100644
    gamescopeDisplayNo?: number;
    /** Linux 控制器：uinput 输入的物理屏幕分辨率（宽/高） */
 diff --git a/src/types/maa.ts b/src/types/maa.ts
-index b5e23cd..f4111b3 100644
+index b5e23cd..dae8acb 100644
 --- a/src/types/maa.ts
 +++ b/src/types/maa.ts
-@@ -95,6 +95,15 @@ export interface GamepadControllerConfig {
+@@ -95,6 +95,30 @@ export interface GamepadControllerConfig {
    display_short_side?: number;
  }
  
@@ -2681,10 +2964,25 @@ index b5e23cd..f4111b3 100644
 +  session_id: string;
 +}
 +
++/** Non-secret observations from the instance-owned browser, not token validation. */
++export interface CloudWebServiceStatus {
++  auth: 'unknown' | 'login_required' | 'authenticated';
++  service:
++    | 'loading'
++    | 'waiting_for_official_page'
++    | 'login_required'
++    | 'starting'
++    | 'reconnecting'
++    | 'waiting_for_stream'
++    | 'stream_ready'
++    | 'observation_stale';
++  ready: boolean;
++}
++
  /** 控制器配置 */
  export type ControllerConfig =
    | AdbControllerConfig
-@@ -103,7 +112,8 @@ export type ControllerConfig =
+@@ -103,7 +127,8 @@ export type ControllerConfig =
    | WlRootsControllerConfig
    | LinuxControllerConfig
    | PlayCoverControllerConfig

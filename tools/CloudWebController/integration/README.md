@@ -64,5 +64,15 @@ The official adapter requires the visible `video#WelinkGameVideo` to have dimens
 
 These signals were observed in an independent authenticated browser, not QtWebEngine. Cloud Linux checks cover Python policy/protocol, source compilation, 14 existing Qt offscreen lifecycle checks and the patched MXU frontend build; Windows packaging, Qt real-game rendering, pointer lock and task compatibility remain unverified. No cookies or authentication values are migrated. Engine diagnostics contain bounded media/capability data and service-stage enums, never login values.
 
+### Authentication and reopening the login window
+
+Authentication status is separate from stream readiness: `unknown`, `login_required`, or `authenticated`. The last value requires positive evidence of a playing official game stream; it is not a server-side token-validity check. A dismissed login prompt only becomes `unknown`. Launching, reconnecting and a stalled stream are not classified as expired authentication. The private status protocol exposes only fixed status values and a readiness boolean, not account details, page text or storage values.
+
+When the observed login prompt returns, automation is blocked and held input is released. MXU retains the profile and browser, shows the need to log in, and requires a manual connection after recovery. The login button can reveal an existing idle browser even when a controller object remains; it does not reload, clear cookies or start the game. Real server-expiry dialogs have not been observed, so unrecognized failure screens remain unknown/not ready rather than claiming automatic expiry recovery.
+
+CloudWeb never auto-connects from saved-device restoration or task/scheduled start. The user must explicitly connect first; an attempted task start on a disconnected CloudWeb controller fails with a manual-connection prompt before pre-actions. This also prevents a scheduled run from clearing the reauthentication latch.
+
+Persistent storage remains at `config/cloudweb-profiles/<hash>/storage`, with a per-instance/per-origin identity and a profile lock. Normal shutdown destroys the page before the profile and waits for child exit. This supplies the persistence mechanism, but real Qt login → exit → restart restoration and server-expiry → manual reauthentication still require runtime verification; crash-time persistence is not guaranteed.
+
 Build into a fresh output using `build_full_package.py assemble --output <new-path>`.
 Never assemble over a directory used by the user, or archive its login profiles.

@@ -7,12 +7,12 @@ serial protocol worker never blocks Qt's UI thread.
 
 import argparse
 import base64
-import json
 import hashlib
+import json
 import os
-from pathlib import Path
 import sys
 import threading
+from pathlib import Path
 
 from qt_policy import bounded_int, https_origin, safe_load_error, validate_webengine_environment
 
@@ -20,6 +20,7 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 METHOD_FIELDS = {
     "connect": (), "connected": (), "screencap": (),
+    "service_status": (), "show": (),
     "click": ("x", "y"),
     "swipe": ("x1", "y1", "x2", "y2", "duration"),
     "touch_down": ("contact", "x", "y", "pressure"),
@@ -69,6 +70,8 @@ def decode_request(line):
 
 
 def dispatch(host, method, params):
+    if method == "service_status":
+        return host.service_status()
     if method == "connect":
         return bool(host.wait_ready(30))
     if method == "connected":
@@ -146,7 +149,7 @@ def main(argv=None):
         offline = args.url in ("", "bundled-fixture")
         if not offline:
             https_origin(args.url)
-        from PySide6.QtCore import QTimer, QLockFile
+        from PySide6.QtCore import QLockFile, QTimer
         from PySide6.QtWidgets import QApplication
         from qt_host import QtBrowserHost
 

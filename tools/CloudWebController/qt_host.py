@@ -171,6 +171,8 @@ class QtBrowserHost(QObject):
         self._official_cloud = is_endfield_cloud(url)
         self._service_ready = False
         self._service_stage = "loading"
+        self._auth_status = "unknown"
+        self._requires_reconnect = False
         self._stream_clock = None
         self._observation_pending = False
         self._document_generation = 0
@@ -278,6 +280,7 @@ class QtBrowserHost(QObject):
                 self._service_ready = False
                 self._stream_clock = None
                 self._service_stage = "observation_stale"
+                self._auth_status = "unknown"
             self._release_inputs()
         if not self._ready or self._observation_pending:
             return
@@ -287,6 +290,7 @@ class QtBrowserHost(QObject):
                 self._service_ready = False
                 self._stream_clock = None
                 self._service_stage = "waiting_for_official_page"
+                self._auth_status = "unknown"
             return
         self._observation_pending = True
         generation = self._document_generation
@@ -299,14 +303,22 @@ class QtBrowserHost(QObject):
                 value = value if isinstance(value, dict) else {}
                 clock = value.get("clock")
                 playable = value.get("playable") is True
+                # Neither a dismissed prompt nor a previously playing stream
+                # proves current authentication while the service is waiting.
+                self._auth_status = "unknown"
                 if value.get("login"):
                     stage = "login_required"
+                    self._auth_status = "login_required"
+                    self._requires_reconnect = True
                 elif value.get("reconnecting"):
                     stage = "reconnecting"
                 elif value.get("starting"):
                     stage = "starting"
                 elif playable and isinstance(clock, (int, float)) and self._stream_clock is not None and clock > self._stream_clock:
                     stage = "stream_ready"
+                    # Positive game-stream evidence, not an absent login button.
+                    # This is not a server-side token-validity check.
+                    self._auth_status = "authenticated"
                 else:
                     stage = "waiting_for_stream"
                 self._stream_clock = clock if playable and isinstance(clock, (int, float)) and stage in ("waiting_for_stream", "stream_ready") else None
@@ -323,6 +335,19 @@ class QtBrowserHost(QObject):
         # A hung renderer must not retain a previously successful observation.
         return self._service_ready and time.monotonic() - self._service_observed_at < 2.0
 
+    def service_status(self):
+        """Bounded status only; never expose page text, account or storage data."""
+        with self._state:
+            self._ensure_open()
+            if not self._official_cloud:
+                return {"auth": "unknown", "service": "waiting_for_stream", "ready": self.connected()}
+            fresh = time.monotonic() - self._service_observed_at < 2.0
+            return {
+                "auth": self._auth_status if fresh else "unknown",
+                "service": self._service_stage if fresh or self._service_stage == "loading" else "observation_stale",
+                "ready": self._service_is_ready() and self._ready and not self._faulted,
+            }
+
     def wait_service_ready(self, timeout=30):
         """Do not connect Maa to a login, launch, reconnect or unobserved queue page."""
         if not self._official_cloud:
@@ -335,7 +360,10 @@ class QtBrowserHost(QObject):
             self._ensure_open()
             if self._load_error:
                 raise RuntimeError(self._load_error)
-            return self._service_is_ready()
+            ready = self._service_is_ready()
+            if ready:
+                self._requires_reconnect = False
+            return ready
 
     def _record_engine_diagnostics(self):
         """Record capabilities and stream state, never page text, URLs or cookies."""
@@ -368,6 +396,7 @@ class QtBrowserHost(QObject):
                 if self._official_cloud:
                     data["serviceStage"] = self._service_stage
                     data["streamReady"] = self._service_is_ready()
+                    data["authStatus"] = self.service_status()["auth"]
                 data["persistentProfile"] = not self.profile.isOffTheRecord()
                 self._diagnostic_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except (ValueError, OSError):
@@ -456,6 +485,8 @@ class QtBrowserHost(QObject):
             self._document_generation += 1
             self._service_ready = False
             self._stream_clock = None
+            self._auth_status = "unknown"
+            self._service_stage = "loading"
 
     @Slot(str)
     def _navigation_blocked(self, reason):
@@ -514,18 +545,25 @@ class QtBrowserHost(QObject):
 
     def connected(self):
         with self._state:
-            return self._ready and not self._closed and not self._faulted
+            return self._ready and not self._closed and not self._faulted and not (
+                self._official_cloud and self._requires_reconnect
+            )
 
     def show(self):
-        return self.call_on_ui(self.view.show)
+        def reveal():
+            self.view.showNormal()
+            self.view.raise_()
+            self.view.activateWindow()
+            return True
+        return self.call_on_ui(reveal)
 
     def title(self):
         return self.call_on_ui(self.view.title)
 
     def _check_surface(self, require_stream=True):
-        if not self.connected():
+        if not self._ready or self._closed or self._faulted:
             raise RuntimeError("Embedded browser is not ready")
-        if require_stream and self._official_cloud and not self._service_is_ready():
+        if require_stream and self._official_cloud and (self._requires_reconnect or not self._service_is_ready()):
             raise RuntimeError("Official cloud game stream is not ready; complete login/start or wait for reconnection")
         if not self.view.isVisible() or self.view.isMinimized():
             raise RuntimeError("Hidden/minimized capture and input are unsupported; restore the embedded view")
