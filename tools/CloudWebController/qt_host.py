@@ -7,22 +7,57 @@ used. Captures cover the web viewport, not the desktop. Actual desktop backgroun
 behavior requires platform testing; hidden/minimized rendering is unsupported.
 """
 
+import json
+import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-import os
-import json
 from threading import Condition, Event
-import time
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, QObject, QPoint, QPointF, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QBuffer,
+    QByteArray,
+    QCoreApplication,
+    QEvent,
+    QIODevice,
+    QObject,
+    QPoint,
+    QPointF,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QImage, QInputMethodEvent, QKeyEvent, QMouseEvent, QWheelEvent
-from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePermission, QWebEnginePage, QWebEngineProfile, QWebEngineSettings, QWebEngineUrlRequestInterceptor
+from PySide6.QtWebEngineCore import (
+    QWebEngineLoadingInfo,
+    QWebEnginePage,
+    QWebEnginePermission,
+    QWebEngineProfile,
+    QWebEngineSettings,
+    QWebEngineUrlRequestInterceptor,
+)
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
-
-from qt_policy import VIEWPORT_HEIGHT, VIEWPORT_WIDTH, allowed_origins as make_origins, bounded_int, canonical_key, https_origin, inside_viewport, mouse_contact, safe_load_error, supported_key, validate_webengine_environment
+from qt_policy import (
+    VIEWPORT_HEIGHT,
+    VIEWPORT_WIDTH,
+    bounded_int,
+    canonical_key,
+    https_origin,
+    inside_viewport,
+    mouse_contact,
+    safe_load_error,
+    supported_key,
+    validate_webengine_environment,
+)
+from qt_policy import allowed_origins as make_origins
+from service_adapters import ENDFIELD_OBSERVATION, is_endfield_cloud
 
 
 @dataclass(eq=False)
@@ -133,6 +168,13 @@ class QtBrowserHost(QObject):
         self._ready = False
         self._load_error: str | None = None
         self._navigation_error: str | None = None
+        self._official_cloud = is_endfield_cloud(url)
+        self._service_ready = False
+        self._service_stage = "loading"
+        self._stream_clock = None
+        self._observation_pending = False
+        self._document_generation = 0
+        self._service_observed_at = 0.0
         self._held_keys: set[int] = set()
         self._held_contacts: set[int] = set()
         self._pointer = QPoint(VIEWPORT_WIDTH // 2, VIEWPORT_HEIGHT // 2)
@@ -212,6 +254,11 @@ class QtBrowserHost(QObject):
         self._requested.connect(self._dispatch, Qt.ConnectionType.QueuedConnection)
         self._close_requested.connect(self.view.close, Qt.ConnectionType.QueuedConnection)
         self._release_requested.connect(self._release_inputs, Qt.ConnectionType.QueuedConnection)
+        if self._official_cloud:
+            self._service_timer = QTimer(self)
+            self._service_timer.setInterval(500)
+            self._service_timer.timeout.connect(self._observe_service)
+            self._service_timer.start()
         if profile_dir is not None:
             self._diagnostic_path = Path(profile_dir) / "engine-diagnostics.json"
             self._diagnostic_timer = QTimer(self)
@@ -222,6 +269,73 @@ class QtBrowserHost(QObject):
             self.view.setHtml(test_html)
         else:
             self.view.setUrl(QUrl(url))
+
+    def _observe_service(self):
+        if self._closed:
+            return
+        if self._service_ready and not self._service_is_ready():
+            with self._state:
+                self._service_ready = False
+                self._stream_clock = None
+                self._service_stage = "observation_stale"
+            self._release_inputs()
+        if not self._ready or self._observation_pending:
+            return
+        if not is_endfield_cloud(self.page.url().toString()):
+            self._release_inputs()
+            with self._state:
+                self._service_ready = False
+                self._stream_clock = None
+                self._service_stage = "waiting_for_official_page"
+            return
+        self._observation_pending = True
+        generation = self._document_generation
+
+        def observed(value):
+            self._observation_pending = False
+            with self._state:
+                if self._closed or not self._ready or generation != self._document_generation:
+                    return
+                value = value if isinstance(value, dict) else {}
+                clock = value.get("clock")
+                playable = value.get("playable") is True
+                if value.get("login"):
+                    stage = "login_required"
+                elif value.get("reconnecting"):
+                    stage = "reconnecting"
+                elif value.get("starting"):
+                    stage = "starting"
+                elif playable and isinstance(clock, (int, float)) and self._stream_clock is not None and clock > self._stream_clock:
+                    stage = "stream_ready"
+                else:
+                    stage = "waiting_for_stream"
+                self._stream_clock = clock if playable and isinstance(clock, (int, float)) and stage in ("waiting_for_stream", "stream_ready") else None
+                self._service_ready = stage == "stream_ready"
+                self._service_observed_at = time.monotonic()
+                self._service_stage = stage
+                self._state.notify_all()
+            if not self._service_ready:
+                self._release_inputs()
+
+        self.page.runJavaScript(ENDFIELD_OBSERVATION, observed)
+
+    def _service_is_ready(self):
+        # A hung renderer must not retain a previously successful observation.
+        return self._service_ready and time.monotonic() - self._service_observed_at < 2.0
+
+    def wait_service_ready(self, timeout=30):
+        """Do not connect Maa to a login, launch, reconnect or unobserved queue page."""
+        if not self._official_cloud:
+            return self.wait_page_ready(timeout)
+        with self._state:
+            self._ensure_open()
+            if self._is_ui():
+                raise RuntimeError("Service readiness must be awaited from a worker")
+            self._state.wait_for(lambda: self._service_is_ready() or self._closed or self._load_error, timeout)
+            self._ensure_open()
+            if self._load_error:
+                raise RuntimeError(self._load_error)
+            return self._service_is_ready()
 
     def _record_engine_diagnostics(self):
         """Record capabilities and stream state, never page text, URLs or cookies."""
@@ -251,6 +365,9 @@ class QtBrowserHost(QObject):
             try:
                 data = json.loads(value)
                 data["pageLoaded"] = self._ready
+                if self._official_cloud:
+                    data["serviceStage"] = self._service_stage
+                    data["streamReady"] = self._service_is_ready()
                 data["persistentProfile"] = not self.profile.isOffTheRecord()
                 self._diagnostic_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except (ValueError, OSError):
@@ -336,6 +453,9 @@ class QtBrowserHost(QObject):
             self._ready = False
             self._load_error = None
             self._navigation_error = None
+            self._document_generation += 1
+            self._service_ready = False
+            self._stream_clock = None
 
     @Slot(str)
     def _navigation_blocked(self, reason):
@@ -378,6 +498,9 @@ class QtBrowserHost(QObject):
             self._state.notify_all()
 
     def wait_ready(self, timeout=30):
+        return self.wait_service_ready(timeout)
+
+    def wait_page_ready(self, timeout=30):
         with self._state:
             self._ensure_open()
             if not self._ready and self._is_ui():
@@ -399,9 +522,11 @@ class QtBrowserHost(QObject):
     def title(self):
         return self.call_on_ui(self.view.title)
 
-    def _check_surface(self):
+    def _check_surface(self, require_stream=True):
         if not self.connected():
             raise RuntimeError("Embedded browser is not ready")
+        if require_stream and self._official_cloud and not self._service_is_ready():
+            raise RuntimeError("Official cloud game stream is not ready; complete login/start or wait for reconnection")
         if not self.view.isVisible() or self.view.isMinimized():
             raise RuntimeError("Hidden/minimized capture and input are unsupported; restore the embedded view")
         if self.view.width() != VIEWPORT_WIDTH or self.view.height() != VIEWPORT_HEIGHT:
@@ -434,8 +559,8 @@ class QtBrowserHost(QObject):
             return rgb[:, :, ::-1].copy()  # Own storage before QImage is destroyed.
         return self.call_on_ui(grab)
 
-    def _input_target(self):
-        self._check_surface()
+    def _input_target(self, require_stream=True):
+        self._check_surface(require_stream)
         target = self.view.focusProxy() or self.view
         target.setFocus(Qt.FocusReason.OtherFocusReason)
         return target
@@ -510,7 +635,7 @@ class QtBrowserHost(QObject):
     def touch_up(self, contact):
         mouse_contact(contact)
         def send():
-            self._input_target()
+            self._input_target(require_stream=False)
             if contact in self._held_contacts:
                 self._held_contacts.remove(contact)
                 self._mouse_event(QEvent.Type.MouseButtonRelease, contact)
@@ -565,7 +690,7 @@ class QtBrowserHost(QObject):
         if not supported_key(code):
             raise ValueError("Supported keys: A-Z, 0-9, F1-F12, arrows, Shift/Ctrl/Alt (including left/right aliases), space, enter, escape, tab, backspace")
         def send():
-            self._input_target()
+            self._input_target(require_stream=down)
             family = canonical_key(code)
             was_held = any(canonical_key(key) == family for key in self._held_keys)
             if down:

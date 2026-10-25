@@ -8,7 +8,7 @@
 - `assets/mxu-cloudweb.json` 是此修改版 MXU 的独立客户端配置，不是 PI V2 扩展版本。`schema_version: 1`、固定的 `controller.name: CloudWeb` 和明确的 `compatible_tasks` / `compatible_options` 列表由客户端验证。
 - 客户端加载配置后，在内存中增加网页控制器及对应的任务适用范围。标准 PI 文件仍可被原版工具读取。
 - `compatible_tasks` 表示复用哪些已有的跨平台桌面任务入口，不表示这些任务已通过真实云游戏验证。Win32 专属的进程、注册表、账号切换等任务不自动开放。
-- 不新增臆造的游戏识别节点、ROI、登录或排队 Pipeline。官方网站可用后，在连接面板填写 HTTPS 地址，手动完成登录、排队并进入游戏画面。
+- 不新增臆造的游戏识别节点、ROI、登录或排队 Pipeline。新实例默认官方 HTTPS 入口，手动完成登录、启动及可能出现的排队；只有观察到官方游戏视频持续播放后才连接。
 
 ## 数据与生命周期
 
@@ -58,13 +58,11 @@ cookies (including session cookies), local storage and cache under
 Normal shutdown asks the child to exit and explicitly destroys its Qt profile;
 unresponsive protocol sessions still terminate to prevent late input.
 
-The official endpoint is not published yet. A collapsed advanced URL field remains
-for development. Queue recognition and automatic task start require real provider
-page states; this preview must not treat document load as game readiness. The native
-GUI CLI still requires a graphical desktop; true headless execution is unsupported.
-The host records bounded video/capability diagnostics without login values in the
-profile directory. Autoplay and user-initiated foreground mouse lock are enabled;
-raw relative automation and real cloud-game compatibility remain unverified.
+The default for new instances is the official `https://endfield.hypergryph.com/cloud` entry; saved URLs and explicit offline configurations remain unchanged. Users log in and start the game manually. An observed same-origin first-login flow required no popup or extra navigation origins, so the existing origin and popup restrictions remain intact.
+
+The official adapter requires the visible `video#WelinkGameVideo` to have dimensions, playable data and an advancing media clock before connecting Maa. Login, observed launch/reconnect messages, a stopped stream or stale observations block automated input. A failed readiness check retains the browser for a later connection attempt; a reconnect does not kill it. Held input is released when readiness is lost. This is not task pause/resume: an interrupted screenshot/action can still fail the running Maa task. Queue UI has not been observed and no queue recognition or automatic start was added.
+
+These signals were observed in an independent authenticated browser, not QtWebEngine. Cloud Linux checks cover Python policy/protocol, source compilation, 14 existing Qt offscreen lifecycle checks and the patched MXU frontend build; Windows packaging, Qt real-game rendering, pointer lock and task compatibility remain unverified. No cookies or authentication values are migrated. Engine diagnostics contain bounded media/capability data and service-stage enums, never login values.
 
 Build into a fresh output using `build_full_package.py assemble --output <new-path>`.
 Never assemble over a directory used by the user, or archive its login profiles.

@@ -6,10 +6,42 @@ observations and tests for input, scaling, codecs, Pointer Lock and background.
 """
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
+from urllib.parse import urlsplit
+
+ENDFIELD_CLOUD_URL = "https://endfield.hypergryph.com/cloud"
 
 
-class ServiceStage(str, Enum):
+def is_endfield_cloud(url):
+    if not url:
+        return False
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.hostname == "endfield.hypergryph.com" and parsed.path.rstrip("/") == "/cloud"
+
+
+# Observed in the official first-login flow. Read only bounded, non-sensitive
+# state: never return page text, input values, URLs, storage or authentication.
+# A homepage/promotional video is not the game stream. Queue UI has not been
+# observed and is deliberately not inferred from a loaded document.
+ENDFIELD_OBSERVATION = """(() => {
+  const video = document.getElementById('WelinkGameVideo');
+  const visible = e => !!e && e.getClientRects().length > 0 &&
+    getComputedStyle(e).visibility !== 'hidden';
+  const text = document.body?.innerText || '';
+  const login = Array.from(document.querySelectorAll('button')).some(
+    e => visible(e) && e.textContent.trim() === '注册/登录');
+  return {
+    login,
+    reconnecting: text.includes('游戏正在重连中'),
+    starting: text.includes('正在检测网络环境') || text.includes('游戏启动中，请耐心等待'),
+    playable: visible(video) && video.readyState >= 2 &&
+      video.videoWidth > 0 && video.videoHeight > 0 && !video.paused && !video.error,
+    clock: video && Number.isFinite(video.currentTime) ? video.currentTime : 0
+  };
+})()"""
+
+
+class ServiceStage(StrEnum):
     PREVIEW = "preview_only"
     NEEDS_USER = "login_queue_or_start_requires_observation"
     STREAM_OBSERVED = "video_frames_observed_not_game_compatibility"

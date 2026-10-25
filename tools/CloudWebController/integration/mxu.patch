@@ -1,6 +1,6 @@
 diff --git a/src-tauri/src/commands/cloud_web.rs b/src-tauri/src/commands/cloud_web.rs
 new file mode 100644
-index 0000000..04847c6
+index 0000000..b42b149
 --- /dev/null
 +++ b/src-tauri/src/commands/cloud_web.rs
 @@ -0,0 +1,917 @@
@@ -422,9 +422,9 @@ index 0000000..04847c6
 +                .and_then(|value| value.as_bool())
 +                == Some(true);
 +            session.ready.store(ready, Ordering::Release);
-+            if !ready {
-+                session.shutdown();
-+            }
++            // A live browser may still be logging in, launching or reconnecting.
++            // Preserve its per-instance profile/session so the user can finish
++            // there and connect again. Transport errors already shut it down.
 +            ready
 +        })
 +    }
@@ -1525,7 +1525,7 @@ index 384bdf5..8f76f98 100644
          Some(p) if !p.trim().is_empty() => p.to_string(),
          _ => {
 diff --git a/src/components/ConnectionPanel.tsx b/src/components/ConnectionPanel.tsx
-index 9744492..407f01b 100644
+index 9744492..42daa5f 100644
 --- a/src/components/ConnectionPanel.tsx
 +++ b/src/components/ConnectionPanel.tsx
 @@ -6,6 +6,7 @@ import {
@@ -1536,11 +1536,12 @@ index 9744492..407f01b 100644
    RefreshCw,
    Loader2,
    Check,
-@@ -36,6 +37,12 @@ import {
+@@ -36,6 +37,13 @@ import {
  } from '@/utils/controller';
  import { getInterfaceLangKey } from '@/i18n';
  import { generateId } from '@/stores/helpers';
 +import {
++  OFFICIAL_CLOUD_WEB_URL,
 +  buildCloudWebControllerConfig,
 +  isValidCloudWebUrl,
 +  getCloudWebDeviceName,
@@ -1549,15 +1550,15 @@ index 9744492..407f01b 100644
  import {
    startGlobalCallbackListener,
    waitForCtrlResult,
-@@ -212,6 +219,7 @@ export function ConnectionPanel() {
+@@ -212,6 +220,7 @@ export function ConnectionPanel() {
    const currentController =
      controllers.find((c) => c.name === currentControllerName) || controllers[0];
    const controllerType = currentController?.type;
-+  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? '';
++  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
    const isDesktopWindowController = isDesktopWindowControllerType(controllerType);
    const { classRegex: desktopWindowClassRegex, titleRegex: desktopWindowTitleRegex } =
      getDesktopWindowFilters(currentController);
-@@ -399,14 +407,18 @@ export function ConnectionPanel() {
+@@ -399,14 +408,18 @@ export function ConnectionPanel() {
            ((savedDevice.gamescopeDisplayNo !== undefined &&
              (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
              (savedDevice.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
@@ -1578,7 +1579,7 @@ index 9744492..407f01b 100644
        // PlayCover 不需要搜索，直接连接
        autoReconnectAttempted.add(instanceId);
        handleConnect();
-@@ -633,8 +645,32 @@ export function ConnectionPanel() {
+@@ -633,8 +646,32 @@ export function ConnectionPanel() {
    };
  
    // 连接设备
@@ -1612,7 +1613,7 @@ index 9744492..407f01b 100644
  
      setIsConnecting(true);
      setDeviceError(null);
-@@ -682,6 +718,13 @@ export function ConnectionPanel() {
+@@ -682,6 +719,13 @@ export function ConnectionPanel() {
          };
          deviceName = selectedWlrootsSocket;
          targetType = 'device';
@@ -1626,7 +1627,7 @@ index 9744492..407f01b 100644
        } else if (controllerType === 'PlayCover') {
          // 保存 PlayCover 地址到实例配置
          setInstanceSavedDevice(instanceId, { playcoverAddress });
-@@ -826,6 +869,8 @@ export function ConnectionPanel() {
+@@ -826,6 +870,8 @@ export function ConnectionPanel() {
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1635,7 +1636,7 @@ index 9744492..407f01b 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -1395,6 +1440,8 @@ export function ConnectionPanel() {
+@@ -1395,6 +1441,8 @@ export function ConnectionPanel() {
        return isLinuxReadyWith(selectedGamescopeInstance, selectedWlrootsSocket);
      }
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
@@ -1644,7 +1645,7 @@ index 9744492..407f01b 100644
      return false;
    };
  
-@@ -1421,6 +1468,9 @@ export function ConnectionPanel() {
+@@ -1421,6 +1469,9 @@ export function ConnectionPanel() {
      // 获取设备显示文本（优先显示具体设备名）
      const getDeviceStatusText = () => {
        const savedDevice = activeInstance?.savedDevice;
@@ -1654,7 +1655,7 @@ index 9744492..407f01b 100644
        if (savedDevice?.adbDeviceName) {
          return truncateText(savedDevice.adbDeviceName, 6);
        }
-@@ -1469,7 +1519,8 @@ export function ConnectionPanel() {
+@@ -1469,7 +1520,8 @@ export function ConnectionPanel() {
            ((s.gamescopeDisplayNo !== undefined &&
              (linuxNeeds?.needGamescopeNode || linuxNeeds?.needEisSocket)) ||
              (s.wlrSocketPath && linuxNeeds?.needWlrSocket))) ||
@@ -1664,7 +1665,7 @@ index 9744492..407f01b 100644
        );
      };
  
-@@ -1668,6 +1719,89 @@ export function ConnectionPanel() {
+@@ -1668,6 +1720,89 @@ export function ConnectionPanel() {
                </div>
              )}
  
@@ -1755,7 +1756,7 @@ index 9744492..407f01b 100644
              {controllerType === 'PlayCover' && (
                <div className="flex gap-2">
 diff --git a/src/components/DeviceSelector.tsx b/src/components/DeviceSelector.tsx
-index 2546c91..4926353 100644
+index 2546c91..6563886 100644
 --- a/src/components/DeviceSelector.tsx
 +++ b/src/components/DeviceSelector.tsx
 @@ -12,6 +12,7 @@ import {
@@ -1766,11 +1767,12 @@ index 2546c91..4926353 100644
    Info,
  } from 'lucide-react';
  import clsx from 'clsx';
-@@ -24,6 +25,13 @@ import {
+@@ -24,6 +25,14 @@ import {
    getDesktopWindowFilters,
    isDesktopWindowControllerType,
  } from '@/utils/controller';
 +import {
++  OFFICIAL_CLOUD_WEB_URL,
 +  buildCloudWebControllerConfig,
 +  isValidCloudWebUrl,
 +  getCloudWebDeviceName,
@@ -1780,7 +1782,7 @@ index 2546c91..4926353 100644
  import { loggers } from '@/utils/logger';
  
  const log = loggers.device;
-@@ -55,7 +63,11 @@ export function DeviceSelector({
+@@ -55,7 +64,11 @@ export function DeviceSelector({
      setCachedWin32Windows,
      setCachedWlrootsSockets,
      registerCtrlIdName,
@@ -1788,11 +1790,11 @@ index 2546c91..4926353 100644
 +    setInstanceSavedDevice,
    } = useAppStore();
 +  const instance = instances.find((item) => item.id === instanceId);
-+  const cloudWebUrl = instance?.savedDevice?.cloudWebUrl ?? '';
++  const cloudWebUrl = instance?.savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
  
    // 选中的设备（本地状态）
    const [selectedAdbDevice, setSelectedAdbDevice] = useState<AdbDevice | null>(null);
-@@ -256,6 +268,10 @@ export function DeviceSelector({
+@@ -256,6 +269,10 @@ export function DeviceSelector({
            wlr_socket_path: selectedWlrootsSocket,
            use_win32_vk_code: controllerDef.wlroots?.use_win32_vk_code ?? false,
          };
@@ -1803,7 +1805,7 @@ index 2546c91..4926353 100644
        } else if (controllerType === 'PlayCover') {
          config = {
            type: 'PlayCover',
-@@ -280,6 +296,8 @@ export function DeviceSelector({
+@@ -280,6 +297,8 @@ export function DeviceSelector({
        } else if (controllerType === 'WlRoots' && selectedWlrootsSocket) {
          deviceName = selectedWlrootsSocket;
          targetType = 'device';
@@ -1812,7 +1814,7 @@ index 2546c91..4926353 100644
        } else if (controllerType === 'PlayCover') {
          deviceName = playcoverAddress;
          targetType = 'device';
-@@ -482,6 +500,8 @@ export function DeviceSelector({
+@@ -482,6 +501,8 @@ export function DeviceSelector({
      if (isDesktopWindowController) return !!selectedWindow;
      if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
@@ -1821,7 +1823,7 @@ index 2546c91..4926353 100644
      return false;
    };
  
-@@ -498,6 +518,8 @@ export function DeviceSelector({
+@@ -498,6 +519,8 @@ export function DeviceSelector({
        case 'MacOS':
        case 'PlayCover':
          return <Apple className="w-4 h-4" />;
@@ -1830,7 +1832,7 @@ index 2546c91..4926353 100644
        case 'Gamepad':
          return <Gamepad2 className="w-4 h-4" />;
        default:
-@@ -520,6 +542,8 @@ export function DeviceSelector({
+@@ -520,6 +543,8 @@ export function DeviceSelector({
          return t('controller.macos');
        case 'Gamepad':
          return t('controller.gamepad');
@@ -1839,7 +1841,7 @@ index 2546c91..4926353 100644
        default:
          return controllerType;
      }
-@@ -539,6 +563,17 @@ export function DeviceSelector({
+@@ -539,6 +564,17 @@ export function DeviceSelector({
          )}
        </div>
  
@@ -1857,7 +1859,7 @@ index 2546c91..4926353 100644
        {/* PlayCover 地址输入 */}
        {controllerType === 'PlayCover' && (
          <div className="space-y-2">
-@@ -687,10 +722,10 @@ export function DeviceSelector({
+@@ -687,10 +723,10 @@ export function DeviceSelector({
        )}
  
        {/* PlayCover 需要手动连接按钮 */}
@@ -1871,14 +1873,15 @@ index 2546c91..4926353 100644
              'w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors',
              isConnecting || !canConnect()
 diff --git a/src/components/Toolbar.tsx b/src/components/Toolbar.tsx
-index 644006d..66317ae 100644
+index 644006d..ef19a91 100644
 --- a/src/components/Toolbar.tsx
 +++ b/src/components/Toolbar.tsx
-@@ -40,6 +40,11 @@ import {
+@@ -40,6 +40,12 @@ import {
    getLinuxDiscoveryNeeds,
    isDesktopWindowControllerType,
  } from '@/utils/controller';
 +import {
++  OFFICIAL_CLOUD_WEB_URL,
 +  buildCloudWebControllerConfig,
 +  isValidCloudWebUrl,
 +  getCloudWebDeviceName,
@@ -1886,7 +1889,7 @@ index 644006d..66317ae 100644
  import { SchedulePanel } from './SchedulePanel';
  import type {
    Instance,
-@@ -433,7 +438,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+@@ -433,7 +439,8 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
          (savedDevice.adbDeviceName ||
            savedDevice.windowName ||
            savedDevice.wlrSocketPath ||
@@ -1896,13 +1899,13 @@ index 644006d..66317ae 100644
        );
        if (!controller) {
          return failStart(t('errors.controllerNotFound'));
-@@ -769,7 +775,16 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
+@@ -769,7 +776,16 @@ export function Toolbar({ showAddPanel, onToggleAddPanel, className }: ToolbarPr
            let deviceName = '';
            let targetType: 'device' | 'window' = 'device';
  
 -          if (canUseSavedDevice && savedDevice && controllerType) {
 +          if (controllerType === 'CloudWeb') {
-+            const url = savedDevice?.cloudWebUrl ?? '';
++            const url = savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
 +            if (!isValidCloudWebUrl(url)) return failStart(t('controller.cloudWebInvalidUrl'));
 +            config = buildCloudWebControllerConfig(targetId, url);
 +            deviceName = getCloudWebDeviceName(config.url, t('controller.cloudWebFixture'));
@@ -1969,15 +1972,16 @@ index 0000000..73fae30
 +  );
 +}
 diff --git a/src/components/connection/useDeviceConnection.ts b/src/components/connection/useDeviceConnection.ts
-index bcc696b..654b2ed 100644
+index bcc696b..fa1a09e 100644
 --- a/src/components/connection/useDeviceConnection.ts
 +++ b/src/components/connection/useDeviceConnection.ts
-@@ -9,7 +9,16 @@ import {
+@@ -9,7 +9,17 @@ import {
    getDesktopWindowFilters,
    isDesktopWindowControllerType,
  } from '@/utils/controller';
 -import { startGlobalCallbackListener, waitForCtrlResult } from './callbackCache';
 +import {
++  OFFICIAL_CLOUD_WEB_URL,
 +  buildCloudWebControllerConfig,
 +  isValidCloudWebUrl,
 +  getCloudWebDeviceName,
@@ -1990,11 +1994,11 @@ index bcc696b..654b2ed 100644
  
  interface UseDeviceConnectionProps {
    instanceId: string;
-@@ -38,6 +47,11 @@ export function useDeviceConnection({
+@@ -38,6 +48,11 @@ export function useDeviceConnection({
    } = useAppStore();
  
    const activeInstance = instances.find((i) => i.id === instanceId);
-+  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? '';
++  const cloudWebUrl = activeInstance?.savedDevice?.cloudWebUrl ?? OFFICIAL_CLOUD_WEB_URL;
 +  const setCloudWebUrl = (url: string) => {
 +    autoReconnectAttempted.add(instanceId);
 +    setInstanceSavedDevice(instanceId, { ...activeInstance?.savedDevice, cloudWebUrl: url });
@@ -2002,7 +2006,7 @@ index bcc696b..654b2ed 100644
  
    const [isSearching, setIsSearching] = useState(false);
    const [isConnecting, setIsConnecting] = useState(false);
-@@ -382,6 +396,44 @@ export function useDeviceConnection({
+@@ -382,6 +397,44 @@ export function useDeviceConnection({
      t,
    ]);
  
@@ -2047,7 +2051,7 @@ index bcc696b..654b2ed 100644
    // 获取选中设备的显示文本
    const getSelectedDeviceText = useCallback(() => {
      const savedDevice = activeInstance?.savedDevice;
-@@ -413,9 +465,13 @@ export function useDeviceConnection({
+@@ -413,9 +466,13 @@ export function useDeviceConnection({
        }
        return t('controller.selectDevice');
      }
@@ -2061,7 +2065,7 @@ index bcc696b..654b2ed 100644
      isDesktopWindowController,
      selectedAdbDevice,
      selectedWindow,
-@@ -430,9 +486,13 @@ export function useDeviceConnection({
+@@ -430,9 +487,13 @@ export function useDeviceConnection({
      if (isDesktopWindowController) return !!selectedWindow;
      if (controllerType === 'WlRoots') return !!selectedWlrootsSocket;
      if (controllerType === 'PlayCover') return playcoverAddress.trim().length > 0;
@@ -2075,7 +2079,7 @@ index bcc696b..654b2ed 100644
      isDesktopWindowController,
      selectedAdbDevice,
      selectedWindow,
-@@ -450,6 +510,7 @@ export function useDeviceConnection({
+@@ -450,6 +511,7 @@ export function useDeviceConnection({
      selectedWindow,
      showDeviceDropdown,
      playcoverAddress,
@@ -2083,7 +2087,7 @@ index bcc696b..654b2ed 100644
      cachedAdbDevices,
      cachedWin32Windows,
      cachedWlrootsSockets,
-@@ -464,11 +525,13 @@ export function useDeviceConnection({
+@@ -464,11 +526,13 @@ export function useDeviceConnection({
      setSelectedWindow,
      setShowDeviceDropdown,
      setPlaycoverAddress,
@@ -2098,7 +2102,7 @@ index bcc696b..654b2ed 100644
      canConnect,
      ensureMaaInitialized,
 diff --git a/src/i18n/locales/en-US.ts b/src/i18n/locales/en-US.ts
-index 154e625..6eae825 100644
+index 154e625..e0c085a 100644
 --- a/src/i18n/locales/en-US.ts
 +++ b/src/i18n/locales/en-US.ts
 @@ -402,6 +402,29 @@ export default {
@@ -2121,10 +2125,10 @@ index 154e625..6eae825 100644
 +    cloudWebLogin: 'Log in',
 +    cloudWebAdvanced: 'Advanced (connection URL)',
 +    cloudWebPreviewNote:
-+      'The official web version is live. Embedded login, streaming and queue completion are not yet verified. Connect only binds the browser; tasks do not start automatically after queuing.',
++      'Log in and start the game manually in the browser window. Connecting requires a playing official game stream. If not ready, the window stays open; connect again later. Tasks never start automatically. Queue handling and Qt compatibility remain unverified.',
 +    cloudWebUrlPlaceholder: 'HTTPS game entry URL (required)',
 +    cloudWebHint:
-+      'Official website: https://endfield.hypergryph.com/cloud . Its play redirect is not yet verified. Existing URLs and local login profiles are preserved. Enter a verified HTTPS game entry to connect.',
++      'Defaults to https://endfield.hypergryph.com/cloud . Existing URLs and login profiles are preserved. Log in and start the game manually before connecting. Embedded Qt compatibility remains unverified.',
 +    cloudWebFixture: 'Local test page',
 +    cloudWebInvalidUrl:
 +      'Enter a valid HTTPS URL without embedded credentials on port 443; a blank URL cannot connect.',
@@ -2132,44 +2136,49 @@ index 154e625..6eae825 100644
      selectController: 'Select Controller',
      adb: 'Android Device',
 diff --git a/src/i18n/locales/ja-JP.ts b/src/i18n/locales/ja-JP.ts
-index 15e63a1..024d2e2 100644
+index 15e63a1..95713ae 100644
 --- a/src/i18n/locales/ja-JP.ts
 +++ b/src/i18n/locales/ja-JP.ts
-@@ -397,6 +397,24 @@ export default {
+@@ -397,6 +397,28 @@ export default {
  
    // コントローラー
    controller: {
-+    cloudWebHostMissing: 'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
-+    cloudWebConnectionFailed: 'ブラウザー接続に失敗しました。切断して再接続し、続く場合はログを確認してください',
++    cloudWebHostMissing:
++      'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
++    cloudWebConnectionFailed:
++      'ブラウザー接続に失敗しました。切断して再接続し、続く場合はログを確認してください',
 +    cloudWebTimeout: '応答がタイムアウトしました。接続を確認して再試行してください',
 +    cloudWebDisconnected: 'クラウドゲームとの接続が切れました。再接続してください',
 +    cloudWebBusy: '切断や再接続の前に実行中のタスクを停止してください',
-+    cloudWebReleaseFailed: 'キーを解放できませんでした。タスクを停止し、ゲームのウィンドウを閉じてください',
++    cloudWebReleaseFailed:
++      'キーを解放できませんでした。タスクを停止し、ゲームのウィンドウを閉じてください',
 +    cloudWebElevated: 'アプリを閉じ、管理者権限を使わずに再起動してから接続してください',
 +    cloudWeb: 'クラウド・エンドフィールド Web版',
 +    cloudWebUrl: 'クラウドゲームのURL',
 +    cloudWebPreviewNote:
-+      '公式Web版は公開済みです。組み込みブラウザーでのログイン、配信映像、待機列の完了検出は未検証です。接続はブラウザーを関連付けるだけで、待機後にタスクは自動開始しません。',
++      'ブラウザー画面で手動ログインし、ゲームを開始してください。公式ゲーム映像の再生を確認してから接続します。準備中は画面を保持するため、後で再接続できます。タスクは自動開始しません。待機列と Qt の実機互換性は未検証です。',
 +    cloudWebAdvanced: '詳細設定（接続URL）',
 +    cloudWebLogin: 'ログイン',
 +    cloudWebUrlPlaceholder: 'HTTPSゲームURL（必須）',
 +    cloudWebHint:
-+      '公式サイト: https://endfield.hypergryph.com/cloud 。ゲーム起動先への遷移は未検証です。既存URLとローカルのログイン設定は維持されます。確認済みのHTTPSゲームURLを入力してください。',
++      '既定の公式URLは https://endfield.hypergryph.com/cloud です。既存URLとログイン設定は維持されます。手動ログインしてゲームを開始後に接続してください。組み込み Qt の実機互換性は未検証です。',
 +    cloudWebFixture: 'ローカル検証ページ',
-+    cloudWebInvalidUrl: '認証情報を含まない、ポート443の有効なHTTPS URLを入力してください。空欄では接続できません。',
++    cloudWebInvalidUrl:
++      '認証情報を含まない、ポート443の有効なHTTPS URLを入力してください。空欄では接続できません。',
      title: 'コントローラー',
      selectController: 'コントローラーを選択',
      adb: 'Android デバイス',
 diff --git a/src/i18n/locales/ko-KR.ts b/src/i18n/locales/ko-KR.ts
-index c3bee79..8f75460 100644
+index c3bee79..3e33d75 100644
 --- a/src/i18n/locales/ko-KR.ts
 +++ b/src/i18n/locales/ko-KR.ts
-@@ -392,6 +392,24 @@ export default {
+@@ -392,6 +392,26 @@ export default {
  
    // 컨트롤러
    controller: {
 +    cloudWebHostMissing: '클라우드 브라우저 구성 요소가 없습니다. 전체 웹 버전 패키지를 설치하세요',
-+    cloudWebConnectionFailed: '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
++    cloudWebConnectionFailed:
++      '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
 +    cloudWebTimeout: '응답 시간이 초과되었습니다. 연결을 확인하고 다시 시도하세요',
 +    cloudWebDisconnected: '클라우드 게임 연결이 끊겼습니다. 다시 연결하세요',
 +    cloudWebBusy: '연결을 끊거나 다시 연결하기 전에 현재 작업을 중지하세요',
@@ -2178,22 +2187,23 @@ index c3bee79..8f75460 100644
 +    cloudWeb: '클라우드 · 엔드필드 웹',
 +    cloudWebUrl: '클라우드 게임 URL',
 +    cloudWebPreviewNote:
-+      '공식 웹 버전이 출시되었습니다. 내장 브라우저 로그인, 스트리밍 및 대기열 완료 감지는 아직 검증되지 않았습니다. 연결은 브라우저만 연결하며 대기 후 작업을 자동으로 시작하지 않습니다.',
++      '브라우저 창에서 직접 로그인하고 게임을 시작하세요. 공식 게임 영상 재생이 확인되어야 연결됩니다. 준비 중이면 창이 유지되므로 나중에 다시 연결하세요. 작업은 자동 시작되지 않습니다. 대기열 및 Qt 실기기 호환성은 아직 검증되지 않았습니다.',
 +    cloudWebAdvanced: '고급 설정 (연결 URL)',
 +    cloudWebLogin: '로그인',
 +    cloudWebUrlPlaceholder: 'HTTPS 게임 주소 (필수)',
 +    cloudWebHint:
-+      '공식 사이트: https://endfield.hypergryph.com/cloud . 게임 실행 주소로의 이동은 아직 검증되지 않았습니다. 기존 URL과 로컬 로그인 설정을 유지합니다. 확인된 HTTPS 게임 주소를 입력하세요.',
++      '기본 공식 주소는 https://endfield.hypergryph.com/cloud 입니다. 기존 URL과 로그인 설정은 유지됩니다. 직접 로그인하고 게임을 시작한 후 연결하세요. 내장 Qt 실기기 호환성은 아직 검증되지 않았습니다.',
 +    cloudWebFixture: '로컬 테스트 페이지',
-+    cloudWebInvalidUrl: '계정 정보가 없고 포트 443을 사용하는 유효한 HTTPS URL을 입력하세요. 비어 있으면 연결할 수 없습니다.',
++    cloudWebInvalidUrl:
++      '계정 정보가 없고 포트 443을 사용하는 유효한 HTTPS URL을 입력하세요. 비어 있으면 연결할 수 없습니다.',
      title: '컨트롤러',
      selectController: '컨트롤러 선택',
      adb: 'Android 기기',
 diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
-index 3dca5fc..ced2b24 100644
+index 3dca5fc..a26e54d 100644
 --- a/src/i18n/locales/zh-CN.ts
 +++ b/src/i18n/locales/zh-CN.ts
-@@ -390,6 +390,23 @@ export default {
+@@ -390,6 +390,24 @@ export default {
  
    // 控制器
    controller: {
@@ -2208,20 +2218,21 @@ index 3dca5fc..ced2b24 100644
 +    cloudWebUrl: '云游戏网页地址',
 +    cloudWebLogin: '登录',
 +    cloudWebAdvanced: '高级设置（连接网址）',
-+    cloudWebPreviewNote: '官方网页版已上线。内嵌登录、串流及排队完成识别尚未验证。连接只绑定浏览器，排队后不会自动运行任务。',
++    cloudWebPreviewNote:
++      '请在登录窗口手动登录并开始游戏。连接需检测到官方游戏视频正在播放；未就绪时保留窗口，稍后可再连接。不会自动启动任务，排队及 Qt 实机兼容性仍待验证。',
 +    cloudWebUrlPlaceholder: '填写 HTTPS 游戏入口（必填）',
 +    cloudWebHint:
-+      '官方主页：https://endfield.hypergryph.com/cloud 。其游戏启动跳转尚未验证。保留已有网址和本机登录配置；连接前请填写已确认的 HTTPS 游戏入口。',
++      '默认使用官方入口 https://endfield.hypergryph.com/cloud 。已有网址和登录配置不变。请手动登录并启动游戏后再连接；内嵌 Qt 实机兼容性仍待验证。',
 +    cloudWebFixture: '本地验证页',
 +    cloudWebInvalidUrl: '请输入不含账号密码、使用 443 端口的有效 HTTPS 地址；留空无法连接。',
      title: '控制器',
      selectController: '选择控制器',
      adb: 'Android 设备',
 diff --git a/src/i18n/locales/zh-TW.ts b/src/i18n/locales/zh-TW.ts
-index f73ab27..60d98d7 100644
+index f73ab27..c6399c6 100644
 --- a/src/i18n/locales/zh-TW.ts
 +++ b/src/i18n/locales/zh-TW.ts
-@@ -386,6 +386,23 @@ export default {
+@@ -386,6 +386,24 @@ export default {
  
    // 控制器
    controller: {
@@ -2234,12 +2245,13 @@ index f73ab27..60d98d7 100644
 +    cloudWebElevated: '請關閉程式，並以一般使用者權限重新啟動後連線',
 +    cloudWeb: '雲·終末地網頁版',
 +    cloudWebUrl: '雲端遊戲網址',
-+    cloudWebPreviewNote: '官方網頁版已上線。內嵌登入、串流及排隊完成辨識尚未驗證。連線只綁定瀏覽器，排隊後不會自動執行任務。',
++    cloudWebPreviewNote:
++      '請在登入視窗手動登入並開始遊戲。連線需偵測到官方遊戲影片正在播放；未就緒時保留視窗，稍後可再連線。不會自動啟動任務，排隊及 Qt 實機相容性仍待驗證。',
 +    cloudWebAdvanced: '進階設定（連線網址）',
 +    cloudWebLogin: '登入',
 +    cloudWebUrlPlaceholder: '輸入 HTTPS 遊戲入口（必填）',
 +    cloudWebHint:
-+      '官方首頁：https://endfield.hypergryph.com/cloud 。遊戲啟動跳轉尚未驗證。保留現有網址和本機登入設定；連線前請輸入已確認的 HTTPS 遊戲入口。',
++      '預設使用官方入口 https://endfield.hypergryph.com/cloud 。已有網址和登入設定不變。請手動登入並啟動遊戲後再連線；內嵌 Qt 實機相容性仍待驗證。',
 +    cloudWebFixture: '本機驗證頁',
 +    cloudWebInvalidUrl: '請輸入不含帳號密碼、使用 443 連接埠的有效 HTTPS 網址；留空無法連線。',
      title: '控制器',
@@ -2684,11 +2696,13 @@ index b5e23cd..f4111b3 100644
  export type ConnectionStatus = 'Disconnected' | 'Connecting' | 'Connected' | { Failed: string };
 diff --git a/src/utils/cloudWebController.ts b/src/utils/cloudWebController.ts
 new file mode 100644
-index 0000000..cc99d45
+index 0000000..5751300
 --- /dev/null
 +++ b/src/utils/cloudWebController.ts
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,63 @@
 +import type { CloudWebControllerConfig } from '@/types/maa';
++
++export const OFFICIAL_CLOUD_WEB_URL = 'https://endfield.hypergryph.com/cloud';
 +
 +/** Empty is intentional: the backend loads its bundled, offline verification page. */
 +export function isValidCloudWebUrl(value: unknown): value is string {
