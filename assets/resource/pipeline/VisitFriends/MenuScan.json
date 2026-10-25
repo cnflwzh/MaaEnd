@@ -7,8 +7,9 @@
             "[JumpBack]VisitFriendsAssistFullInit",
             "[JumpBack]VisitFriendsAssistFull",
             "[JumpBack]VisitFriendsClueExchangeFull",
-            "VisitFriendsMenuScanFriendsFull",
-            "[JumpBack]VisitFriendsMenuScanTargetFriendOpenPriorityRemark",
+            "VisitFriendsFull",
+            "[JumpBack]VisitFriendsMenuScanTargetFriendOpenPriority",
+            "[JumpBack]VisitFriendsPrioritySearchNext",
             "[JumpBack]VisitFriendsMenuScanTargetFriendOpenRemark",
             "[JumpBack]VisitFriendsMenuScanTargetFriendOpen",
             "VisitFriendsMenuScanScrollFinish",
@@ -43,12 +44,12 @@
             "visited": []
         }
     },
-    "VisitFriendsMenuScanSelectPriorityRemarkConsumable": {
+    "VisitFriendsMenuScanSelectPriorityConsumable": {
         "desc": "白名单优先选友：匹配所有好友，只保留 whitelist 命中的；与其它选友共享 visited",
         "recognition": "Custom",
         "custom_recognition": "ExpendableRecognition",
         "custom_recognition_param": {
-            "candidate": "VisitFriendsRecognitionItemWithPriorityRemark",
+            "candidate": "VisitFriendsRecognitionItemWithPriority",
             "visited_node": "VisitFriendsMenuScanVisited",
             "key_regex": "(?:[（(])?([^（(）)]*\\#\\d+)"
         }
@@ -73,25 +74,21 @@
             "key_regex": "(?:[（(])?([^（(）)]*\\#\\d+)"
         }
     },
-    "VisitFriendsMenuScanTargetFriendOpenPriorityRemark": {
+    "VisitFriendsMenuScanTargetFriendOpenPriority": {
         "desc": "白名单优先链路：名字框 ∧ 进船图标；只处理 whitelist 命中的备注好友",
         "enabled": false,
         "recognition": "And",
         "all_of": [
-            "VisitFriendsMenuScanSelectPriorityRemarkConsumable",
-            "VisitFriendsRecognitionItemEnterButtonByNamePriorityRemark"
+            "VisitFriendsMenuScanSelectPriorityConsumable",
+            "VisitFriendsRecognitionItemEnterButtonByNamePriority"
         ],
         "box_index": 1,
         "pre_delay": 0,
         "action": "Click",
-        // 记录白名单链路的进船节点，供共享 max_hit 计数后继续执行本链路。
-        "anchor": {
-            "VisitFriendsEnterShipTarget": "VisitFriendsEnterShipPriorityRemark"
-        },
         "post_wait_freezes": 200,
         "post_delay": 0,
         "next": [
-            "VisitFriendsCheckAssistPriorityRemark",
+            "VisitFriendsCheckAssistPriority",
             "VisitFriendsMenuScanDetailClose"
         ]
     },
@@ -106,10 +103,6 @@
         "box_index": 1,
         "pre_delay": 0,
         "action": "Click",
-        // 记录备注链路的进船节点，供共享 max_hit 计数后继续执行本链路。
-        "anchor": {
-            "VisitFriendsEnterShipTarget": "VisitFriendsEnterShipRemark"
-        },
         "post_wait_freezes": 200,
         "post_delay": 0,
         "next": [
@@ -127,10 +120,6 @@
         "box_index": 1,
         "pre_delay": 0,
         "action": "Click",
-        // 记录普通链路的进船节点，供共享 max_hit 计数后继续执行本链路。
-        "anchor": {
-            "VisitFriendsEnterShipTarget": "VisitFriendsEnterShip"
-        },
         "post_wait_freezes": 200,
         "post_delay": 0,
         "next": [
@@ -138,7 +127,7 @@
             "VisitFriendsMenuScanDetailClose"
         ]
     },
-    "VisitFriendsCheckAssistPriorityRemark": {
+    "VisitFriendsCheckAssistPriority": {
         "desc": "白名单链路打开详情后检查可访问资源，进船点击复用白名单选中的飞船框",
         "recognition": "And",
         "all_of": [
@@ -149,9 +138,68 @@
         "post_delay": 0,
         "rate_limit": 0,
         "next": [
-            "VisitFriendsEnterShipBudget",
-            "VisitFriendsVisitLimitReached"
+            "VisitFriendsEnterShipPriority"
         ]
+    },
+    "VisitFriendsPrioritySearchNext": {
+        "desc": "白名单搜索分流：队列非空时走搜索流程",
+        "enabled": false,
+        "recognition": "DirectHit",
+        "pre_delay": 0,
+        "post_delay": 0,
+        "next": [
+            "VisitFriendsPrioritySearchExhausted",
+            "VisitFriendsPrioritySearchFocusBox",
+            "TextInputClearBox"
+        ]
+    },
+    "VisitFriendsPrioritySearchFocusBox": {
+        "desc": "点击搜索框占位文本使其获得焦点",
+        "recognition": "OCR",
+        "roi": [
+            175,
+            65,
+            190,
+            35
+        ],
+        "expected": [
+            "输入名称搜索好友",
+            "輸入名稱搜尋好友",
+            "(?i)Search\\s*friend\\s*by\\s*name",
+            "名前を入力して検索"
+        ],
+        "threshold": 0.7,
+        "pre_delay": 0,
+        "action": "Click",
+        "target_offset": [
+            30,
+            0,
+            0,
+            0
+        ],
+        "post_delay": 0,
+        "next": [
+            "TextInput"
+        ]
+    },
+    "VisitFriendsPrioritySearchWaitResult": {
+        "desc": "输入完成后持续识别过滤结果行：命中进白名单进船拜访链，3 秒内未出现视为未搜到，清空输入框搜索下一个",
+        "recognition": "DirectHit",
+        "pre_delay": 0,
+        "post_delay": 0,
+        "timeout": 3000,
+        "next": [
+            "VisitFriendsMenuScanTargetFriendOpenPriority"
+        ],
+        "on_error": [
+            "VisitFriendsPrioritySearchNext"
+        ]
+    },
+    "VisitFriendsPrioritySearchDone": {
+        "desc": "优先好友已全部搜索拜访完成",
+        "recognition": "DirectHit",
+        "pre_delay": 0,
+        "post_delay": 0
     },
     "VisitFriendsCheckAssistRemark": {
         "desc": "备注链路打开详情后检查可访问资源，进船点击复用备注选中的飞船框",
@@ -164,8 +212,7 @@
         "post_delay": 0,
         "rate_limit": 0,
         "next": [
-            "VisitFriendsEnterShipBudget",
-            "VisitFriendsVisitLimitReached"
+            "VisitFriendsEnterShipRemark"
         ]
     },
     "VisitFriendsMenuScanScrollFinish": {
@@ -184,8 +231,8 @@
         "pre_delay": 0,
         "post_delay": 0,
         "next": [
-            "VisitFriendsMenuScanPriorityRemarkFallbackToRemark",
-            "VisitFriendsMenuScanPriorityRemarkFallbackToNormal",
+            "VisitFriendsMenuScanPriorityFallbackToRemark",
+            "VisitFriendsMenuScanPriorityFallbackToNormal",
             "VisitFriendsMenuScanRemarkFallback",
             "VisitFriendsMenuScanScrollFinishDone"
         ],
@@ -201,7 +248,38 @@
             "Node.Recognition.Succeeded": "好友列表已滚动到底部，拜访完成"
         }
     },
-    "VisitFriendsMenuScanPriorityRemarkFallbackToRemark": {
+    "VisitFriendsBtwSellRestore": {
+        "desc": "恢复顺便出售覆盖的所有节点",
+        "max_hit": 1,
+        "recognition": "DirectHit",
+        "pre_delay": 0,
+        "action": "Custom",
+        "custom_action": "PipelineOverrideAction",
+        "custom_action_param": {
+            "patch": {
+                "VisitFriendsAssistFull": {
+                    "enabled": true
+                },
+                "VisitFriendsFull": {
+                    "enabled": true
+                },
+                "VisitFriendsCheckAssistBtwSell": {
+                    "enabled": false
+                },
+                "VisitFriendsShipEnterStockRedistribution": {
+                    "enabled": false
+                }
+            }
+        },
+        "post_delay": 0,
+        "next": [
+            "VisitFriendsMenuScanRemarkFallbackReopen"
+        ],
+        "focus": {
+            "Node.Action.Succeeded": "已恢复顺便出售的所有覆盖"
+        }
+    },
+    "VisitFriendsMenuScanPriorityFallbackToRemark": {
         "desc": "白名单扫完：关闭白名单链路，开启备注链路，清空滚动模板；max_hit=1",
         "enabled": false,
         "max_hit": 1,
@@ -211,7 +289,7 @@
         "custom_action": "PipelineOverrideAction",
         "custom_action_param": {
             "patch": {
-                "VisitFriendsMenuScanTargetFriendOpenPriorityRemark": {
+                "VisitFriendsMenuScanTargetFriendOpenPriority": {
                     "enabled": false
                 },
                 "VisitFriendsMenuScanTargetFriendOpenRemark": {
@@ -221,18 +299,21 @@
                     "attach": {
                         "ready": false
                     }
+                },
+                "VisitFriendsPrioritySearchNext": {
+                    "enabled": false
                 }
             }
         },
         "post_delay": 0,
         "next": [
-            "VisitFriendsMenuScanRemarkFallbackReopen"
+            "VisitFriendsBtwSellRestore"
         ],
         "focus": {
             "Node.Action.Succeeded": "白名单已扫完，转为备注好友继续拜访"
         }
     },
-    "VisitFriendsMenuScanPriorityRemarkFallbackToNormal": {
+    "VisitFriendsMenuScanPriorityFallbackToNormal": {
         "desc": "白名单扫完：关闭白名单链路，直接开启普通链路，清空滚动模板；max_hit=1",
         "enabled": false,
         "max_hit": 1,
@@ -242,7 +323,7 @@
         "custom_action": "PipelineOverrideAction",
         "custom_action_param": {
             "patch": {
-                "VisitFriendsMenuScanTargetFriendOpenPriorityRemark": {
+                "VisitFriendsMenuScanTargetFriendOpenPriority": {
                     "enabled": false
                 },
                 "VisitFriendsMenuScanTargetFriendOpenRemark": {
@@ -258,12 +339,15 @@
                     "attach": {
                         "ready": false
                     }
+                },
+                "VisitFriendsPrioritySearchNext": {
+                    "enabled": false
                 }
             }
         },
         "post_delay": 0,
         "next": [
-            "VisitFriendsMenuScanRemarkFallbackReopen"
+            "VisitFriendsBtwSellRestore"
         ],
         "focus": {
             "Node.Action.Succeeded": "白名单已扫完，重新打开列表并拜访任意好友"
@@ -316,40 +400,6 @@
             "VisitFriendsMenu"
         ]
     },
-    "VisitFriendsMenuScanFriendsFull": {
-        "desc": "拜访好友已达到上限：助力次数与线索交换次数均归零",
-        "recognition": "And",
-        "all_of": [
-            "VisitFriendsAssistCountZero",
-            "VisitFriendsClueExchangeCountZero"
-        ],
-        "pre_delay": 0,
-        "post_delay": 0,
-        "focus": {
-            "Node.Recognition.Succeeded": "拜访好友次数已满，停止拜访"
-        }
-    },
-    "VisitFriendsVisitLimitReached": {
-        "desc": "已达到设置的好友拜访次数上限，关闭好友详情",
-        "recognition": "And",
-        "all_of": [
-            "GrayCancelButton"
-        ],
-        "pre_delay": 0,
-        "action": "Click",
-        "post_wait_freezes": 400,
-        "post_delay": 0,
-        "next": [
-            "VisitFriendsVisitLimitStop"
-        ]
-    },
-    "VisitFriendsVisitLimitStop": {
-        "desc": "拜访次数已达上限，结束任务",
-        "recognition": "DirectHit",
-        "pre_delay": 0,
-        "action": "StopTask",
-        "post_delay": 0
-    },
     "VisitFriendsMenuScanScrollList": {
         "desc": "列表未到底时向下滚动：ListComplete 未命中时落到本节点。滑动后 post_wait_freezes 等列表静止再回到扫描，否则惯性会被当成画面变化而无法判定到底",
         "recognition": "DirectHit",
@@ -374,14 +424,14 @@
             "VisitFriendsCheckAssistClueExchange",
             "VisitFriendsCheckAssistControlNexus",
             "VisitFriendsCheckAssistMFGCabin",
-            "VisitFriendsCheckAssistGrowthChamber"
+            "VisitFriendsCheckAssistGrowthChamber",
+            "VisitFriendsCheckAssistBtwSell"
         ],
         "pre_wait_freezes": 100,
         "pre_delay": 0,
         "post_delay": 0,
         "next": [
-            "VisitFriendsEnterShipBudget",
-            "VisitFriendsVisitLimitReached"
+            "VisitFriendsEnterShip"
         ]
     },
     "VisitFriendsCheckAssistClueExchange": {
@@ -454,6 +504,13 @@
             255
         ],
         "count": 2
+    },
+    "VisitFriendsCheckAssistBtwSell": {
+        "desc": "顺便出售：跳过可访问资源检查，白名单好友全部进船；默认关闭，由 BtwAutoStockpileElasticGoodsEnable 开启",
+        "enabled": false,
+        "recognition": "DirectHit",
+        "pre_delay": 0,
+        "post_delay": 0
     },
     "VisitFriendsMenuScanDetailClose": {
         "desc": "关闭好友船详情",

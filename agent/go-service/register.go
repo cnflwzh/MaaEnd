@@ -20,6 +20,7 @@ import (
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/charactercontroller"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/clearhitcount"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/closegame"
+	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/exitlauncher"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/expendable"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/expressionrecognition"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/failurecollector"
@@ -31,6 +32,7 @@ import (
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/repeataction"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/schedule"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/subtask"
+	"github.com/MaaXYZ/MaaEnd/agent/go-service/common/textinput"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/creditshopping"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/deliveryjobs"
 	"github.com/MaaXYZ/MaaEnd/agent/go-service/dijiangrewards"
@@ -71,12 +73,14 @@ func registerAll() {
 	failurecollector.Register()
 	clearhitcount.Register()
 	closegame.Register()
+	exitlauncher.Register()
 	pipelineoverride.Register()
 	expressionrecognition.Register()
 	focusocr.Register()
 	listcomplete.Register()
 	expendable.Register()
 	attachregex.Register()
+	textinput.Register()
 	autoalt.Register()
 	camerascan.Register()
 	charactercontroller.Register()
