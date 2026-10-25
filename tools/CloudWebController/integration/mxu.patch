@@ -2119,15 +2119,15 @@ index 154e625..6eae825 100644
 +    cloudWeb: 'Cloud · Endfield Web',
 +    cloudWebUrl: 'Cloud game URL',
 +    cloudWebLogin: 'Log in',
-+    cloudWebAdvanced: 'Advanced (preview debug URL)',
++    cloudWebAdvanced: 'Advanced (connection URL)',
 +    cloudWebPreviewNote:
-+      'Login is saved locally. The official entry is not available yet; Connect binds the browser only. Automatic tasks after queuing are not enabled.',
-+    cloudWebUrlPlaceholder: 'HTTPS debug URL (official entry not yet available)',
++      'The official web version is live. Embedded login, streaming and queue completion are not yet verified. Connect only binds the browser; tasks do not start automatically after queuing.',
++    cloudWebUrlPlaceholder: 'HTTPS game entry URL (required)',
 +    cloudWebHint:
-+      'Enter the cloud game HTTPS entry point. Leave empty for the bundled offline test page; it does not log in or enter the real game. Each instance has its own browser session.',
++      'Official website: https://endfield.hypergryph.com/cloud . Its play redirect is not yet verified. Existing URLs and local login profiles are preserved. Enter a verified HTTPS game entry to connect.',
 +    cloudWebFixture: 'Local test page',
 +    cloudWebInvalidUrl:
-+      'Enter a valid HTTPS URL without embedded credentials, or leave empty for the local test page',
++      'Enter a valid HTTPS URL without embedded credentials on port 443; a blank URL cannot connect.',
      title: 'Controller',
      selectController: 'Select Controller',
      adb: 'Android Device',
@@ -2139,24 +2139,24 @@ index 15e63a1..024d2e2 100644
  
    // コントローラー
    controller: {
-+    cloudWebHostMissing:
-+      'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
-+    cloudWebConnectionFailed:
-+      'ブラウザー接続に失敗しました。切断して再接続し、続く場合はログを確認してください',
++    cloudWebHostMissing: 'ブラウザー部品がありません。完全な Web 版パッケージをインストールしてください',
++    cloudWebConnectionFailed: 'ブラウザー接続に失敗しました。切断して再接続し、続く場合はログを確認してください',
 +    cloudWebTimeout: '応答がタイムアウトしました。接続を確認して再試行してください',
 +    cloudWebDisconnected: 'クラウドゲームとの接続が切れました。再接続してください',
 +    cloudWebBusy: '切断や再接続の前に実行中のタスクを停止してください',
-+    cloudWebReleaseFailed:
-+      'キーを解放できませんでした。タスクを停止し、ゲームのウィンドウを閉じてください',
++    cloudWebReleaseFailed: 'キーを解放できませんでした。タスクを停止し、ゲームのウィンドウを閉じてください',
 +    cloudWebElevated: 'アプリを閉じ、管理者権限を使わずに再起動してから接続してください',
 +    cloudWeb: 'クラウド・エンドフィールド Web版',
 +    cloudWebUrl: 'クラウドゲームのURL',
-+    cloudWebUrlPlaceholder: 'HTTPS URL（空欄でローカル検証）',
++    cloudWebPreviewNote:
++      '公式Web版は公開済みです。組み込みブラウザーでのログイン、配信映像、待機列の完了検出は未検証です。接続はブラウザーを関連付けるだけで、待機後にタスクは自動開始しません。',
++    cloudWebAdvanced: '詳細設定（接続URL）',
++    cloudWebLogin: 'ログイン',
++    cloudWebUrlPlaceholder: 'HTTPSゲームURL（必須）',
 +    cloudWebHint:
-+      'クラウドゲームの HTTPS URL を入力してください。空欄では同梱のローカル検証ページを使用し、ログインや実際のゲーム開始は行いません。設定ごとに独立したブラウザーセッションを使用します。',
++      '公式サイト: https://endfield.hypergryph.com/cloud 。ゲーム起動先への遷移は未検証です。既存URLとローカルのログイン設定は維持されます。確認済みのHTTPSゲームURLを入力してください。',
 +    cloudWebFixture: 'ローカル検証ページ',
-+    cloudWebInvalidUrl:
-+      '認証情報を含まない有効な HTTPS URL を入力するか、ローカル検証のため空欄にしてください',
++    cloudWebInvalidUrl: '認証情報を含まない、ポート443の有効なHTTPS URLを入力してください。空欄では接続できません。',
      title: 'コントローラー',
      selectController: 'コントローラーを選択',
      adb: 'Android デバイス',
@@ -2164,13 +2164,12 @@ diff --git a/src/i18n/locales/ko-KR.ts b/src/i18n/locales/ko-KR.ts
 index c3bee79..8f75460 100644
 --- a/src/i18n/locales/ko-KR.ts
 +++ b/src/i18n/locales/ko-KR.ts
-@@ -392,6 +392,22 @@ export default {
+@@ -392,6 +392,24 @@ export default {
  
    // 컨트롤러
    controller: {
 +    cloudWebHostMissing: '클라우드 브라우저 구성 요소가 없습니다. 전체 웹 버전 패키지를 설치하세요',
-+    cloudWebConnectionFailed:
-+      '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
++    cloudWebConnectionFailed: '브라우저 연결에 실패했습니다. 연결을 끊고 다시 연결한 후에도 계속되면 로그를 확인하세요',
 +    cloudWebTimeout: '응답 시간이 초과되었습니다. 연결을 확인하고 다시 시도하세요',
 +    cloudWebDisconnected: '클라우드 게임 연결이 끊겼습니다. 다시 연결하세요',
 +    cloudWebBusy: '연결을 끊거나 다시 연결하기 전에 현재 작업을 중지하세요',
@@ -2178,12 +2177,15 @@ index c3bee79..8f75460 100644
 +    cloudWebElevated: '앱을 닫고 관리자 권한 없이 다시 시작한 뒤 연결하세요',
 +    cloudWeb: '클라우드 · 엔드필드 웹',
 +    cloudWebUrl: '클라우드 게임 URL',
-+    cloudWebUrlPlaceholder: 'HTTPS URL (비우면 로컬 테스트)',
++    cloudWebPreviewNote:
++      '공식 웹 버전이 출시되었습니다. 내장 브라우저 로그인, 스트리밍 및 대기열 완료 감지는 아직 검증되지 않았습니다. 연결은 브라우저만 연결하며 대기 후 작업을 자동으로 시작하지 않습니다.',
++    cloudWebAdvanced: '고급 설정 (연결 URL)',
++    cloudWebLogin: '로그인',
++    cloudWebUrlPlaceholder: 'HTTPS 게임 주소 (필수)',
 +    cloudWebHint:
-+      '클라우드 게임 HTTPS 주소를 입력하세요. 비워 두면 포함된 오프라인 테스트 페이지를 사용하며 로그인하거나 실제 게임을 시작하지 않습니다. 각 설정은 독립된 브라우저 세션을 사용합니다.',
++      '공식 사이트: https://endfield.hypergryph.com/cloud . 게임 실행 주소로의 이동은 아직 검증되지 않았습니다. 기존 URL과 로컬 로그인 설정을 유지합니다. 확인된 HTTPS 게임 주소를 입력하세요.',
 +    cloudWebFixture: '로컬 테스트 페이지',
-+    cloudWebInvalidUrl:
-+      '인증 정보가 없는 유효한 HTTPS URL을 입력하거나 로컬 테스트를 위해 비워 두세요',
++    cloudWebInvalidUrl: '계정 정보가 없고 포트 443을 사용하는 유효한 HTTPS URL을 입력하세요. 비어 있으면 연결할 수 없습니다.',
      title: '컨트롤러',
      selectController: '컨트롤러 선택',
      adb: 'Android 기기',
@@ -2191,7 +2193,7 @@ diff --git a/src/i18n/locales/zh-CN.ts b/src/i18n/locales/zh-CN.ts
 index 3dca5fc..ced2b24 100644
 --- a/src/i18n/locales/zh-CN.ts
 +++ b/src/i18n/locales/zh-CN.ts
-@@ -390,6 +390,24 @@ export default {
+@@ -390,6 +390,23 @@ export default {
  
    // 控制器
    controller: {
@@ -2205,14 +2207,13 @@ index 3dca5fc..ced2b24 100644
 +    cloudWeb: '云·终末地网页版',
 +    cloudWebUrl: '云游戏网页地址',
 +    cloudWebLogin: '登录',
-+    cloudWebAdvanced: '高级设置（预开发调试网址）',
-+    cloudWebPreviewNote:
-+      '登录状态保存在本机。官方入口尚未上线；连接只绑定浏览器，排队后自动运行任务暂未启用。',
-+    cloudWebUrlPlaceholder: '填写 HTTPS 调试网址（官方入口待公布）',
++    cloudWebAdvanced: '高级设置（连接网址）',
++    cloudWebPreviewNote: '官方网页版已上线。内嵌登录、串流及排队完成识别尚未验证。连接只绑定浏览器，排队后不会自动运行任务。',
++    cloudWebUrlPlaceholder: '填写 HTTPS 游戏入口（必填）',
 +    cloudWebHint:
-+      '填写云游戏的 HTTPS 入口。留空使用随包本地验证页，不会登录或进入真实游戏。每个配置使用独立浏览器会话。',
++      '官方主页：https://endfield.hypergryph.com/cloud 。其游戏启动跳转尚未验证。保留已有网址和本机登录配置；连接前请填写已确认的 HTTPS 游戏入口。',
 +    cloudWebFixture: '本地验证页',
-+    cloudWebInvalidUrl: '请输入不含账号密码的有效 HTTPS 地址，或留空使用本地验证页',
++    cloudWebInvalidUrl: '请输入不含账号密码、使用 443 端口的有效 HTTPS 地址；留空无法连接。',
      title: '控制器',
      selectController: '选择控制器',
      adb: 'Android 设备',
@@ -2220,7 +2221,7 @@ diff --git a/src/i18n/locales/zh-TW.ts b/src/i18n/locales/zh-TW.ts
 index f73ab27..60d98d7 100644
 --- a/src/i18n/locales/zh-TW.ts
 +++ b/src/i18n/locales/zh-TW.ts
-@@ -386,6 +386,20 @@ export default {
+@@ -386,6 +386,23 @@ export default {
  
    // 控制器
    controller: {
@@ -2233,11 +2234,14 @@ index f73ab27..60d98d7 100644
 +    cloudWebElevated: '請關閉程式，並以一般使用者權限重新啟動後連線',
 +    cloudWeb: '雲·終末地網頁版',
 +    cloudWebUrl: '雲端遊戲網址',
-+    cloudWebUrlPlaceholder: 'HTTPS 網址（留空使用本機驗證頁）',
++    cloudWebPreviewNote: '官方網頁版已上線。內嵌登入、串流及排隊完成辨識尚未驗證。連線只綁定瀏覽器，排隊後不會自動執行任務。',
++    cloudWebAdvanced: '進階設定（連線網址）',
++    cloudWebLogin: '登入',
++    cloudWebUrlPlaceholder: '輸入 HTTPS 遊戲入口（必填）',
 +    cloudWebHint:
-+      '輸入雲端遊戲 HTTPS 入口。留空使用隨附本機驗證頁，不會登入或進入真實遊戲。每個設定使用獨立瀏覽器工作階段。',
++      '官方首頁：https://endfield.hypergryph.com/cloud 。遊戲啟動跳轉尚未驗證。保留現有網址和本機登入設定；連線前請輸入已確認的 HTTPS 遊戲入口。',
 +    cloudWebFixture: '本機驗證頁',
-+    cloudWebInvalidUrl: '請輸入不含帳號密碼的有效 HTTPS 網址，或留空使用本機驗證頁',
++    cloudWebInvalidUrl: '請輸入不含帳號密碼、使用 443 連接埠的有效 HTTPS 網址；留空無法連線。',
      title: '控制器',
      selectController: '選擇控制器',
      adb: 'Android 裝置',
